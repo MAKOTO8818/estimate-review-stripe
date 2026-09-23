@@ -1,0 +1,21 @@
+{
+  "name": "estimate-review-stripe",
+  "version": "1.0.0",
+  "description": "",
+  "main": "pricing.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "@line/bot-sdk": "^9.4.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pdf-parse": "^1.1.1",
+    "stripe": "^17.0.0"
+  }
+}
