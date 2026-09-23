@@ -78,7 +78,10 @@ app.post(
 );
 
 // 通常のJSONボディパーサーは、Stripe Webhookルートより後ろに置く
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.path === '/line/webhook') return next();
+  express.json()(req, res, next);
+});
 
 // --- LINEからの見積書受付 ---
 // lineMiddleware が x-line-signature を検証し、req.body.events を渡してくれる。
