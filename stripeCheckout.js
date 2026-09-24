@@ -36,7 +36,9 @@ async function createEstimateReviewCheckoutSession({
   }
 
   const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
+      mode: 'payment',
+      managed_payments: { enabled: false },    
+    
    
     line_items: [
       {
