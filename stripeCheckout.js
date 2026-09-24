@@ -37,7 +37,7 @@ async function createEstimateReviewCheckoutSession({
 
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
-    payment_method_types: ['card'], // クレジットカードのみ
+   
     line_items: [
       {
         quantity: 1,
