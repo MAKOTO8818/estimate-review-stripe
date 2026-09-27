@@ -1,12 +1,23 @@
 /**
  * AI一次チェックエージェント (構造化データ版)
  *
- * pdfRows.js が抽出した「ページ・行ごとの構造化データ(項目/数量/単位/単価/金額)」を受け取り、
- * Claude APIで一行ずつ厳密にチェックする。
+ * 役割:
+ *   pdfRows.js が抽出した「ページ・行ごとの構造化データ(項目/数量/単位/単価/金額)」を受け取り、
+ *   Claude APIで一行ずつ厳密にチェックする。
+ *   出力は「人間の最終確認者(専門家)」がそのまま読んで承認/修正できる形式にする。
  *
- *   (1) 数量×単価と金額が一致しているかの機械的チェックをコード側で行い(100%正確)、
- *   (2) 単価の相場妥当性・項目の不明瞭さなどはAIが行の単位で判断する
- * という2段構えにして精度を上げている。
+ *   以前は pdf-parse によるフラットな文字列をそのままAIに渡していたため、
+ *   「だいたいの雰囲気」でしか判断できなかった。
+ *   このバージョンでは、
+ *     (1) 数量×単価と金額が一致しているかの機械的チェックをコード側で行い(100%正確)、
+ *     (2) 単価の相場妥当性・項目の不明瞭さなどはAIが行の単位で判断する
+ *   という2段構えにして精度を上げている。
+ *
+ * 前提:
+ *   - ANTHROPIC_API_KEY を環境変数に設定すること
+ *   - npm install @anthropic-ai/sdk が必要
+ *   - PDFの構造化抽出(pdfRows.js)は呼び出し側で行い、
+ *     structuredPages として渡すこと
  */
 
 const Anthropic = require('@anthropic-ai/sdk');
@@ -33,6 +44,9 @@ const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」
 - 個人や会社を誹謗中傷しない。あくまで見積書の記載内容に対する客観的な指摘に留める。
 - findings の "page" と "itemText" は、入力データに登場する値をそのまま(一字一句変えずに)使うこと。
   この値は自動的にPDF上の該当箇所への注釈(マーカー)配置に使われるため、要約したり言い換えたりしないこと。
+- 出力全体が長くなりすぎて途中で切れることを避けるため、各 "concern" "basis" "expertQuestion" は
+  それぞれ120文字程度までを目安に簡潔にまとめること。findings は特に重要な論点を優先し、
+  最大20件程度を目安とすること(それ以上の軽微な指摘は expertChecklist に要約して含めてよい)。
 
 # チェック観点(行単位で細かく確認すること)
 1. 単価の妥当性(一般的な相場との乖離) — 特に単価が明記されている行は重点的に確認する
@@ -60,6 +74,9 @@ const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」
   "expertChecklist": ["最終確認者が特に見るべきポイントを箇条書きで"]
 }`;
 
+/**
+ * 数値文字列(カンマ区切り含む)をパースする。パースできない場合は null。
+ */
 function parseNum(str) {
   if (str === null || str === undefined || str === '-') return null;
   const cleaned = String(str).replace(/,/g, '').trim();
@@ -68,6 +85,12 @@ function parseNum(str) {
   return Number.isNaN(n) ? null : n;
 }
 
+/**
+ * 数量×単価 と 金額 が一致しているかを、コード側で機械的にチェックする。
+ * AIの判断に頼らない、100%正確な補完チェック。
+ * @param {Array<PageData>} pages pdfRows.jsの出力(pages配列)
+ * @returns {Array} findings形式の配列(source: 'arithmetic' 付き)
+ */
 function arithmeticCheck(pages) {
   const findings = [];
 
@@ -81,7 +104,7 @@ function arithmeticCheck(pages) {
 
       const expected = qty * unitPrice;
       const diff = Math.abs(expected - amount);
-      const tolerance = Math.max(1, amount * 0.01);
+      const tolerance = Math.max(1, amount * 0.01); // 1%または1円の誤差は丸め誤差として許容
 
       if (diff > tolerance) {
         findings.push({
@@ -102,6 +125,9 @@ function arithmeticCheck(pages) {
   return findings;
 }
 
+/**
+ * 構造化データをAIに渡すためのテキスト形式に変換する
+ */
 function buildStructuredText(pages) {
   const lines = [];
   for (const page of pages) {
@@ -119,6 +145,80 @@ function buildStructuredText(pages) {
   return lines.join('\n');
 }
 
+/**
+ * AIの応答が途中で(トークン上限などにより)切れてしまい、
+ * 完全なJSONとして閉じていない場合に、
+ * そこまでに完成している findings 配列の要素だけを救い出して、
+ * 閉じ括弧を補って解析可能な形に修復する。
+ * 修復できない場合は null を返す。
+ */
+function repairTruncatedJson(rawJson) {
+  let inString = false;
+  let escape = false;
+  const stack = [];
+  let lastSafeCut = -1;
+  let lastSafeStack = null;
+
+  for (let i = 0; i < rawJson.length; i++) {
+    const ch = rawJson[i];
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === '{' || ch === '[') {
+      stack.push(ch);
+    } else if (ch === '}' || ch === ']') {
+      const opener = stack.pop();
+      const isMatch = (ch === '}' && opener === '{') || (ch === ']' && opener === '[');
+      if (!isMatch) {
+        // 括弧の対応が崩れている = ここより前が安全圏
+        break;
+      }
+      // 「配列の直下でオブジェクトを1つ閉じ終えた直後」を安全な切断点として記録する
+      // (findings配列の要素を1件閉じ終えたタイミングに相当)
+      if (ch === '}' && stack[stack.length - 1] === '[') {
+        lastSafeCut = i + 1;
+        lastSafeStack = stack.slice();
+      }
+    }
+  }
+
+  if (lastSafeCut === -1 || !lastSafeStack) return null;
+
+  const closing = lastSafeStack
+    .slice()
+    .reverse()
+    .map((b) => (b === '{' ? '}' : ']'))
+    .join('');
+
+  const repairedStr = rawJson.slice(0, lastSafeCut) + closing;
+
+  try {
+    return JSON.parse(repairedStr);
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * 見積書の構造化データをAIで一次チェックする
+ * @param {Array<PageData>} structuredPages pdfRows.extractStructuredPdf() が返す pages 配列
+ * @param {object} [context] 追加情報(工事種別など、わかれば精度が上がる)
+ * @param {string} [context.workType] 例: "外壁塗装", "リフォーム", "注文住宅"
+ * @returns {Promise<object>} { summary, findings, unclearItems, expertChecklist }
+ *   findings には、コード側の機械チェック(arithmeticCheck)の結果もマージして含まれる。
+ */
 async function reviewEstimate(structuredPages, context = {}) {
   if (!Array.isArray(structuredPages) || structuredPages.length === 0) {
     throw new Error('structuredPages が空です。PDFからの構造化抽出に失敗している可能性があります。');
@@ -148,16 +248,32 @@ async function reviewEstimate(structuredPages, context = {}) {
   }
 
   let aiResult;
-  try {
+  let wasTruncated = false;
+  {
     const jsonMatch = textBlock.text.match(/\{[\s\S]*\}/);
-    aiResult = JSON.parse(jsonMatch ? jsonMatch[0] : textBlock.text);
-  } catch (err) {
-    throw new Error(`AI応答のJSON解析に失敗しました: ${err.message}\n生の応答: ${textBlock.text}`);
+    const rawJson = jsonMatch ? jsonMatch[0] : textBlock.text;
+    try {
+      aiResult = JSON.parse(rawJson);
+    } catch (err) {
+      // AIの応答がトークン上限などで途中で切れた場合、
+      // そこまでに完成している指摘事項だけを救い出して処理を続行する。
+      const repaired = repairTruncatedJson(rawJson);
+      if (repaired) {
+        console.warn(
+          '⚠️ AI応答の一部が途中で切れていたため、自動修復して処理を続行しました(検出できた範囲の指摘のみ反映されます)。'
+        );
+        aiResult = repaired;
+        wasTruncated = true;
+      } else {
+        throw new Error(`AI応答のJSON解析に失敗しました: ${err.message}\n生の応答: ${textBlock.text}`);
+      }
+    }
   }
 
   const arithmeticFindings = arithmeticCheck(structuredPages);
   const aiFindings = (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai' }));
 
+  // 機械チェックとAIチェックが同じ項目を重複して指摘した場合、機械チェックの結果を優先して残す
   const dedupedAiFindings = aiFindings.filter(
     (af) =>
       !arithmeticFindings.some(
@@ -175,6 +291,7 @@ async function reviewEstimate(structuredPages, context = {}) {
     findings,
     unclearItems: aiResult.unclearItems || [],
     expertChecklist: aiResult.expertChecklist || [],
+    truncated: wasTruncated,
   };
 }
 
