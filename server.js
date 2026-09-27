@@ -32,7 +32,7 @@ const PORT = process.env.PORT || 4242;
 
 const EXPERT_LINE_USER_ID = process.env.EXPERT_LINE_USER_ID;
 const BASE_URL = process.env.BASE_URL || 'https://estimate-review-stripe.onrender.com';
-const FONT_PATH = path.join(__dirname, 'fonts', 'ipag.ttf');
+const FONT_PATH = path.join(__dirname, 'ipag.ttf');
 const GENERATED_DIR = path.join(__dirname, 'generated');
 fs.mkdirSync(GENERATED_DIR, { recursive: true });
 
