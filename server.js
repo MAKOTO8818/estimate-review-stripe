@@ -13,6 +13,7 @@
  * 8. 元のPDFに直接、色付け・番号マーカーを書き込み + 詳細一覧ページを追加 -> pdfAnnotate.js
  * 9. 専門家(管理者)のLINEに、添削済みPDFの確認依頼を通知
  * 10. 専門家が確認画面で承認 -> お客様のLINEに「添削済みPDFのリンク + 簡単な文章」を送信
+ *     (確認画面では、専門家自身が書き込んだPDFをアップロードして差し替えることもできる)
  */
 
 require('dotenv').config();
@@ -20,6 +21,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const multer = require('multer');
 const { calculatePrice } = require('./pricing');
 const { createEstimateReviewCheckoutSession, stripe } = require('./stripeCheckout');
 const { reviewEstimate } = require('./aiReview');
@@ -37,6 +39,19 @@ const GENERATED_DIR = path.join(__dirname, 'generated');
 fs.mkdirSync(GENERATED_DIR, { recursive: true });
 
 app.use('/files', express.static(GENERATED_DIR));
+
+// 専門家が「自分で書き込んだPDF」をアップロードするための設定
+// (メモリ上で受け取り、そのままgenerated/に書き込む。20MBまで、PDFのみ許可)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype !== 'application/pdf') {
+      return cb(new Error('PDFファイルのみアップロードできます。'));
+    }
+    cb(null, true);
+  },
+});
 
 const seenLineUserIds = new Set();
 function isFirstTimeUser(lineUserId) {
@@ -219,6 +234,7 @@ async function startEstimateReview({ lineUserId, pageCount }) {
       unmatchedCount: unmatchedFindings.length,
       pdfFileName,
       approved: false,
+      replacedByExpert: false,
     });
 
     if (EXPERT_LINE_USER_ID) {
@@ -303,10 +319,26 @@ app.get('/admin/review/:id', (req, res) => {
       <h3>指摘事項一覧</h3>
       <ul style="padding-left: 20px;">${findingsHtml || '<li>特筆すべき指摘はありませんでした。</li>'}</ul>
 
-      <p style="color:#666; font-size:0.9em;">
-        ※ 内容を修正したい場合は、PDFをダウンロードして直接書き込み・修正後、サポートまでご連絡いただくか、
-        修正版をあらためてアップロードする運用としています(専門家によるPDF直接編集画面は今後の拡張予定です)。
-      </p>
+      ${
+        review.replacedByExpert
+          ? '<p style="color:#06c755; font-weight:bold;">✓ あなたが書き込んだPDFに差し替え済みです。上の「添削済みPDFを開く」のリンクは、その差し替え後のPDFを開きます。</p>'
+          : ''
+      }
+
+      <div style="border:1px solid #ddd; border-radius:8px; padding:16px; margin: 20px 0;">
+        <h3 style="margin-top:0;">ご自身でPDFに書き込みを追加する場合</h3>
+        <p style="color:#666; font-size:0.9em;">
+          上のリンクからPDFをダウンロードし、お使いの端末(iPadの手書きアプリ、PCのPDF編集ソフトなど)で
+          直接コメントや修正を書き込んだあと、そのファイルをここからアップロードしてください。
+          お客様に送信されるPDFが、アップロードした内容に差し替わります。
+        </p>
+        <form method="POST" action="/admin/review/${req.params.id}/upload" enctype="multipart/form-data" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <input type="file" name="pdf" accept="application/pdf" required>
+          <button type="submit" style="font-size:14px; padding:10px 16px; background:#1a73e8; color:white; border:none; border-radius:8px;">
+            アップロードして差し替える
+          </button>
+        </form>
+      </div>
 
       <form method="POST" action="/admin/review/${req.params.id}/approve">
         <button type="submit" style="font-size:18px; padding:14px 28px; background:#06c755; color:white; border:none; border-radius:8px; width:100%;">
@@ -316,6 +348,30 @@ app.get('/admin/review/:id', (req, res) => {
     </body>
     </html>
   `);
+});
+
+app.post('/admin/review/:id/upload', (req, res) => {
+  upload.single('pdf')(req, res, (err) => {
+    const review = pendingReviews.get(req.params.id);
+    if (!review) {
+      return res.status(404).send('<p>このレビューは見つかりません。</p>');
+    }
+    if (review.approved) {
+      return res.send('<p>既にお客様へ送信済みのため、差し替えできません。</p>');
+    }
+    if (err) {
+      console.error('❌ PDFアップロードエラー:', err.message);
+      return res.status(400).send(`<p>アップロードに失敗しました: ${escapeHtml(err.message)}</p><p><a href="/admin/review/${req.params.id}">戻る</a></p>`);
+    }
+    if (!req.file) {
+      return res.status(400).send(`<p>ファイルが選択されていません。</p><p><a href="/admin/review/${req.params.id}">戻る</a></p>`);
+    }
+
+    fs.writeFileSync(path.join(GENERATED_DIR, review.pdfFileName), req.file.buffer);
+    review.replacedByExpert = true;
+
+    res.redirect(`/admin/review/${req.params.id}`);
+  });
 });
 
 app.post('/admin/review/:id/approve', async (req, res) => {
