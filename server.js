@@ -1,42 +1,43 @@
 /**
- * AI見積り添削 - 自動化サーバーのプロトタイプ
+ * AI見積り添削 - 自動化サーバー
  *
  * 流れ:
- * 1. LINEで見積書(PDF/画像)を受付      -> POST /line/webhook
- * 2. ページ数から金額を自動計算         -> pricing.js
+ * 1. LINEで見積書(PDF)を受付             -> POST /line/webhook
+ * 2. ページ数から金額を自動計算            -> pricing.js
  * 3. 無料枠のみなら決済不要、即添削開始
- *    有料分があればCheckout Session発行 -> stripeCheckout.js
- * 4. 決済完了をWebhookで検知           -> POST /stripe/webhook
+ *    有料分があればCheckout Session発行    -> stripeCheckout.js
+ * 4. 決済完了をWebhookで検知              -> POST /stripe/webhook
  * 5. 受注確定・添削開始のトリガー
- * 6. AI一次チェック完了 -> 専門家(管理者)のLINEに承認依頼を通知
- * 7. 専門家が確認画面で承認 -> お客様のLINEに結果を送信
- *
- * 注意: これは「配線」を示すプロトタイプです。
- * - LINE Messaging APIとの実際のやり取り(署名検証・PDF/画像の取得)
- * - PDFの実際のページ数カウント(例: pdf-lib, pdf-parse などのライブラリ)
- * - 「初回利用者かどうか」の永続的な判定(データベースが必要。ここではメモリ上のSetで代用)
- * - 承認待ちレビューの永続化(データベースが必要。ここではメモリ上のMapで代用)
- * は、実際の開発時に組み込んでください。
+ * 6. PDFを構造化抽出(項目/数量/単位/単価/金額) -> pdfRows.js
+ * 7. AI一次チェック(構造化データを行単位で厳密チェック) -> aiReview.js
+ * 8. 元のPDFに直接、色付け・番号マーカーを書き込み + 詳細一覧ページを追加 -> pdfAnnotate.js
+ * 9. 専門家(管理者)のLINEに、添削済みPDFの確認依頼を通知
+ * 10. 専門家が確認画面で承認 -> お客様のLINEに「添削済みPDFのリンク + 簡単な文章」を送信
  */
 
 require('dotenv').config();
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const { calculatePrice } = require('./pricing');
 const { createEstimateReviewCheckoutSession, stripe } = require('./stripeCheckout');
 const { reviewEstimate } = require('./aiReview');
 const { client: lineClient, middleware: lineMiddleware } = require('./lineClient');
-const { extractPdfInfo } = require('./pdfUtils');
+const { extractStructuredPdf } = require('./pdfRows');
+const { annotatePdf } = require('./pdfAnnotate');
 
 const app = express();
 const PORT = process.env.PORT || 4242;
 
-// 専門家(最終確認者)自身のLINEユーザーID。ここに承認依頼の通知が届く。
 const EXPERT_LINE_USER_ID = process.env.EXPERT_LINE_USER_ID;
-// 承認リンクの組み立てに使うベースURL(Renderの公開URL)
 const BASE_URL = process.env.BASE_URL || 'https://estimate-review-stripe.onrender.com';
+const FONT_PATH = path.join(__dirname, 'fonts', 'ipag.ttf');
+const GENERATED_DIR = path.join(__dirname, 'generated');
+fs.mkdirSync(GENERATED_DIR, { recursive: true });
 
-// 初回利用者かどうかの判定用(本番ではDBに置き換える)
+app.use('/files', express.static(GENERATED_DIR));
+
 const seenLineUserIds = new Set();
 function isFirstTimeUser(lineUserId) {
   return !seenLineUserIds.has(lineUserId);
@@ -45,8 +46,6 @@ function markUserAsSeen(lineUserId) {
   seenLineUserIds.add(lineUserId);
 }
 
-// --- Stripe Webhook は署名検証のため「生のボディ」が必要 ---
-// 必ず express.json() より前、かつこのルート専用で raw を使うこと。
 app.post(
   '/stripe/webhook',
   express.raw({ type: 'application/json' }),
@@ -76,9 +75,6 @@ app.post(
         amountTotal: session.amount_total,
       });
 
-      // 受注確定 → AI一次チェックエージェントを起動する。
-      // extractedText は、LINEから受け取ったPDFをテキスト抽出したものを
-      // どこかに一時保存しておき、ここで読み出す想定(本番ではDB/ストレージに置き換え)。
       startEstimateReview({ lineUserId: line_user_id, pageCount: Number(page_count) });
     }
 
@@ -86,15 +82,11 @@ app.post(
   }
 );
 
-// 通常のJSONボディパーサーは、Stripe Webhookルートより後ろに置く
 app.use((req, res, next) => {
   if (req.path === '/line/webhook') return next();
   express.json()(req, res, next);
 });
 
-// --- LINEからの見積書受付 ---
-// lineMiddleware が x-line-signature を検証し、req.body.events を渡してくれる。
-// このルートは express.json() より前段に置いても lineMiddleware が自前でボディを読むため問題ない。
 app.post('/line/webhook', lineMiddleware, async (req, res) => {
   try {
     const events = req.body.events || [];
@@ -113,19 +105,29 @@ async function handleLineEvent(event) {
   const replyToken = event.replyToken;
   const message = event.message;
 
-  // --- PDFファイルの受付 ---
   if (message.type === 'file' && message.fileName?.toLowerCase().endsWith('.pdf')) {
     const buffer = await downloadLineContent(message.id);
-    const { pageCount, text } = await extractPdfInfo(buffer);
 
-    pendingEstimateTexts.set(userId, text);
+    let pageCount;
+    try {
+      const structured = await extractStructuredPdf(buffer);
+      pageCount = structured.pageCount;
+    } catch (err) {
+      console.error('❌ PDF構造化抽出エラー:', err.message);
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text: '見積書PDFの読み込みに失敗しました。お手数ですが、別のファイルでお試しいただくか、サポートまでご連絡ください。',
+      });
+      return;
+    }
+
+    pendingEstimatePdfs.set(userId, buffer);
 
     const firstTime = isFirstTimeUser(userId);
     const { amount, breakdown } = calculatePrice(pageCount, firstTime);
     console.log(breakdown);
 
     if (amount === 0) {
-      // 初回利用・1ページのみ = 無料。決済不要でそのまま添削開始。
       markUserAsSeen(userId);
       await lineClient.replyMessage(replyToken, {
         type: 'text',
@@ -152,8 +154,6 @@ async function handleLineEvent(event) {
     return;
   }
 
-  // --- 画像で送られてきた場合 ---
-  // 画像からのテキスト抽出(OCR)は未実装のため、PDFでの送付をお願いする。
   if (message.type === 'image') {
     await lineClient.replyMessage(replyToken, {
       type: 'text',
@@ -162,7 +162,6 @@ async function handleLineEvent(event) {
     return;
   }
 
-  // --- それ以外のテキストメッセージ等 ---
   if (message.type === 'text') {
     await lineClient.replyMessage(replyToken, {
       type: 'text',
@@ -171,11 +170,6 @@ async function handleLineEvent(event) {
   }
 }
 
-/**
- * LINEのContent APIからメッセージ本体(画像/ファイル)をBufferとして取得する
- * @param {string} messageId
- * @returns {Promise<Buffer>}
- */
 async function downloadLineContent(messageId) {
   const stream = await lineClient.getMessageContent(messageId);
   const chunks = [];
@@ -185,30 +179,45 @@ async function downloadLineContent(messageId) {
   return Buffer.concat(chunks);
 }
 
-// --- AI一次チェックエージェントの起動口 ---
-// pendingEstimateTexts: lineUserId -> PDF抽出テキスト の一時置き場(本番ではDB/ストレージに置き換える)
-const pendingEstimateTexts = new Map();
-
-// 承認待ちレビュー: reviewId -> { lineUserId, pageCount, summary, approved }
+const pendingEstimatePdfs = new Map();
 const pendingReviews = new Map();
 
 async function startEstimateReview({ lineUserId, pageCount }) {
-  const extractedText = pendingEstimateTexts.get(lineUserId);
-  if (!extractedText) {
-    console.error(`⚠️ ${lineUserId} の見積書テキストが見つかりません。PDF受付時の保存処理を確認してください。`);
+  const pdfBuffer = pendingEstimatePdfs.get(lineUserId);
+  if (!pdfBuffer) {
+    console.error(`⚠️ ${lineUserId} の見積書PDFが見つかりません。PDF受付時の保存処理を確認してください。`);
     return;
   }
 
   try {
-    const result = await reviewEstimate(extractedText);
-    console.log('🤖 AI一次チェック完了:', { lineUserId, pageCount, summary: result.summary });
+    const { pages } = await extractStructuredPdf(pdfBuffer);
+    const result = await reviewEstimate(pages);
+    console.log('🤖 AI一次チェック完了:', {
+      lineUserId,
+      pageCount,
+      summary: result.summary,
+      findingsCount: result.findings.length,
+    });
 
-    // 専門家(人間の最終確認者)向けに承認依頼を作成する。
+    const { buffer: annotatedBuffer, matchedCount, unmatchedFindings } = await annotatePdf(
+      pdfBuffer,
+      pages,
+      result.findings,
+      FONT_PATH
+    );
+
     const reviewId = crypto.randomUUID();
+    const pdfFileName = `${reviewId}.pdf`;
+    fs.writeFileSync(path.join(GENERATED_DIR, pdfFileName), annotatedBuffer);
+
     pendingReviews.set(reviewId, {
       lineUserId,
       pageCount,
       summary: result.summary,
+      findings: result.findings,
+      matchedCount,
+      unmatchedCount: unmatchedFindings.length,
+      pdfFileName,
       approved: false,
     });
 
@@ -217,16 +226,16 @@ async function startEstimateReview({ lineUserId, pageCount }) {
         type: 'text',
         text:
           `【添削結果 確認依頼】\n` +
-          `ページ数: ${pageCount}\n\n` +
+          `ページ数: ${pageCount} / 指摘件数: ${result.findings.length}件(PDFに反映: ${matchedCount}件)\n\n` +
           `${result.summary}\n\n` +
-          `内容を確認し、お客様に送信するにはこちら:\n` +
+          `添削済みPDFの確認・お客様への送信はこちら:\n` +
           `${BASE_URL}/admin/review/${reviewId}`,
       });
     } else {
       console.error('⚠️ EXPERT_LINE_USER_ID が未設定のため、専門家への通知をスキップしました。');
     }
   } catch (err) {
-    console.error('❌ AI一次チェックでエラー:', err.message);
+    console.error('❌ AI一次チェック/PDF添削でエラー:', err);
     if (EXPERT_LINE_USER_ID) {
       await lineClient.pushMessage(EXPERT_LINE_USER_ID, {
         type: 'text',
@@ -246,7 +255,10 @@ function escapeHtml(str) {
   }[c]));
 }
 
-// --- 専門家向け 確認・承認画面 ---
+function severityLabel(sev) {
+  return { high: '🔴重要', medium: '🟠確認推奨', low: '🔵参考' }[sev] || '🟠確認推奨';
+}
+
 app.get('/admin/review/:id', (req, res) => {
   const review = pendingReviews.get(req.params.id);
   if (!review) {
@@ -256,6 +268,18 @@ app.get('/admin/review/:id', (req, res) => {
     return res.send('<p>このレビューは既にお客様へ送信済みです。</p>');
   }
 
+  const pdfUrl = `${BASE_URL}/files/${review.pdfFileName}`;
+  const findingsHtml = review.findings
+    .map(
+      (f, i) => `
+        <li style="margin-bottom:10px;">
+          <b>${severityLabel(f.severity)} (${f.page}ページ) ${escapeHtml(f.itemText || '')}</b><br>
+          ${escapeHtml(f.concern || '')}<br>
+          <span style="color:#666;font-size:0.9em;">根拠: ${escapeHtml(f.basis || '')}</span>
+        </li>`
+    )
+    .join('');
+
   res.send(`
     <!DOCTYPE html>
     <html lang="ja">
@@ -264,10 +288,26 @@ app.get('/admin/review/:id', (req, res) => {
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>見積り添削 確認</title>
     </head>
-    <body style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; line-height: 1.6;">
+    <body style="font-family: sans-serif; padding: 20px; max-width: 700px; margin: auto; line-height: 1.6;">
       <h2>見積り添削 内容確認</h2>
-      <p><b>ページ数:</b> ${review.pageCount}</p>
+      <p><b>ページ数:</b> ${review.pageCount} / <b>指摘件数:</b> ${review.findings.length}件(PDFに反映: ${review.matchedCount}件)</p>
+
+      <p style="margin: 20px 0;">
+        <a href="${pdfUrl}" target="_blank" style="display:inline-block; font-size:16px; padding:12px 20px; background:#1a73e8; color:white; border-radius:8px; text-decoration:none;">
+          添削済みPDFを開く
+        </a>
+      </p>
+
       <div style="white-space: pre-wrap; background:#f5f5f5; padding:16px; border-radius:8px; margin: 16px 0;">${escapeHtml(review.summary)}</div>
+
+      <h3>指摘事項一覧</h3>
+      <ul style="padding-left: 20px;">${findingsHtml || '<li>特筆すべき指摘はありませんでした。</li>'}</ul>
+
+      <p style="color:#666; font-size:0.9em;">
+        ※ 内容を修正したい場合は、PDFをダウンロードして直接書き込み・修正後、サポートまでご連絡いただくか、
+        修正版をあらためてアップロードする運用としています(専門家によるPDF直接編集画面は今後の拡張予定です)。
+      </p>
+
       <form method="POST" action="/admin/review/${req.params.id}/approve">
         <button type="submit" style="font-size:18px; padding:14px 28px; background:#06c755; color:white; border:none; border-radius:8px; width:100%;">
           この内容でお客様に送信する
@@ -287,11 +327,15 @@ app.post('/admin/review/:id/approve', async (req, res) => {
     return res.send('<p>既に送信済みです。</p>');
   }
 
+  const pdfUrl = `${BASE_URL}/files/${review.pdfFileName}`;
+
   try {
     await lineClient.pushMessage(review.lineUserId, {
       type: 'text',
       text:
-        `【AI見積り添削 結果】\n\n${review.summary}\n\n` +
+        `【AI見積り添削 結果】\n\n` +
+        `見積書を専門家が確認いたしました。気になる箇所には印をつけ、PDF内に直接コメントを記載しております。\n\n` +
+        `添削済みPDFはこちら:\n${pdfUrl}\n\n` +
         `ご不明点があれば、こちらのトークにご返信ください。`,
     });
     review.approved = true;
