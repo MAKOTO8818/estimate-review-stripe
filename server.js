@@ -8,15 +8,19 @@
  *    有料分があればCheckout Session発行 -> stripeCheckout.js
  * 4. 決済完了をWebhookで検知           -> POST /stripe/webhook
  * 5. 受注確定・添削開始のトリガー
+ * 6. AI一次チェック完了 -> 専門家(管理者)のLINEに承認依頼を通知
+ * 7. 専門家が確認画面で承認 -> お客様のLINEに結果を送信
  *
  * 注意: これは「配線」を示すプロトタイプです。
  * - LINE Messaging APIとの実際のやり取り(署名検証・PDF/画像の取得)
  * - PDFの実際のページ数カウント(例: pdf-lib, pdf-parse などのライブラリ)
  * - 「初回利用者かどうか」の永続的な判定(データベースが必要。ここではメモリ上のSetで代用)
+ * - 承認待ちレビューの永続化(データベースが必要。ここではメモリ上のMapで代用)
  * は、実際の開発時に組み込んでください。
  */
 
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const { calculatePrice } = require('./pricing');
 const { createEstimateReviewCheckoutSession, stripe } = require('./stripeCheckout');
@@ -26,6 +30,11 @@ const { extractPdfInfo } = require('./pdfUtils');
 
 const app = express();
 const PORT = process.env.PORT || 4242;
+
+// 専門家(最終確認者)自身のLINEユーザーID。ここに承認依頼の通知が届く。
+const EXPERT_LINE_USER_ID = process.env.EXPERT_LINE_USER_ID;
+// 承認リンクの組み立てに使うベースURL(Renderの公開URL)
+const BASE_URL = process.env.BASE_URL || 'https://estimate-review-stripe.onrender.com';
 
 // 初回利用者かどうかの判定用(本番ではDBに置き換える)
 const seenLineUserIds = new Set();
@@ -180,6 +189,9 @@ async function downloadLineContent(messageId) {
 // pendingEstimateTexts: lineUserId -> PDF抽出テキスト の一時置き場(本番ではDB/ストレージに置き換える)
 const pendingEstimateTexts = new Map();
 
+// 承認待ちレビュー: reviewId -> { lineUserId, pageCount, summary, approved }
+const pendingReviews = new Map();
+
 async function startEstimateReview({ lineUserId, pageCount }) {
   const extractedText = pendingEstimateTexts.get(lineUserId);
   if (!extractedText) {
@@ -191,14 +203,104 @@ async function startEstimateReview({ lineUserId, pageCount }) {
     const result = await reviewEstimate(extractedText);
     console.log('🤖 AI一次チェック完了:', { lineUserId, pageCount, summary: result.summary });
 
-    // ここで result を専門家(人間の最終確認者)向けの管理画面/通知に渡す。
-    // 例: notifyExpertReviewer({ lineUserId, aiResult: result });
-    // 専門家の承認後、LINEで施主に結果を返信する処理へ続く。
+    // 専門家(人間の最終確認者)向けに承認依頼を作成する。
+    const reviewId = crypto.randomUUID();
+    pendingReviews.set(reviewId, {
+      lineUserId,
+      pageCount,
+      summary: result.summary,
+      approved: false,
+    });
+
+    if (EXPERT_LINE_USER_ID) {
+      await lineClient.pushMessage(EXPERT_LINE_USER_ID, {
+        type: 'text',
+        text:
+          `【添削結果 確認依頼】\n` +
+          `ページ数: ${pageCount}\n\n` +
+          `${result.summary}\n\n` +
+          `内容を確認し、お客様に送信するにはこちら:\n` +
+          `${BASE_URL}/admin/review/${reviewId}`,
+      });
+    } else {
+      console.error('⚠️ EXPERT_LINE_USER_ID が未設定のため、専門家への通知をスキップしました。');
+    }
   } catch (err) {
     console.error('❌ AI一次チェックでエラー:', err.message);
-    // 例: notifyExpertReviewer({ lineUserId, error: err.message }); で人間に丸投げする
+    if (EXPERT_LINE_USER_ID) {
+      await lineClient.pushMessage(EXPERT_LINE_USER_ID, {
+        type: 'text',
+        text: `【エラー】AI一次チェックに失敗しました(lineUserId: ${lineUserId})。\n${err.message}`,
+      }).catch(() => {});
+    }
   }
 }
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[c]));
+}
+
+// --- 専門家向け 確認・承認画面 ---
+app.get('/admin/review/:id', (req, res) => {
+  const review = pendingReviews.get(req.params.id);
+  if (!review) {
+    return res.status(404).send('<p>このレビューは見つかりません。URLが正しいかご確認ください。</p>');
+  }
+  if (review.approved) {
+    return res.send('<p>このレビューは既にお客様へ送信済みです。</p>');
+  }
+
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>見積り添削 確認</title>
+    </head>
+    <body style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; line-height: 1.6;">
+      <h2>見積り添削 内容確認</h2>
+      <p><b>ページ数:</b> ${review.pageCount}</p>
+      <div style="white-space: pre-wrap; background:#f5f5f5; padding:16px; border-radius:8px; margin: 16px 0;">${escapeHtml(review.summary)}</div>
+      <form method="POST" action="/admin/review/${req.params.id}/approve">
+        <button type="submit" style="font-size:18px; padding:14px 28px; background:#06c755; color:white; border:none; border-radius:8px; width:100%;">
+          この内容でお客様に送信する
+        </button>
+      </form>
+    </body>
+    </html>
+  `);
+});
+
+app.post('/admin/review/:id/approve', async (req, res) => {
+  const review = pendingReviews.get(req.params.id);
+  if (!review) {
+    return res.status(404).send('<p>このレビューは見つかりません。</p>');
+  }
+  if (review.approved) {
+    return res.send('<p>既に送信済みです。</p>');
+  }
+
+  try {
+    await lineClient.pushMessage(review.lineUserId, {
+      type: 'text',
+      text:
+        `【AI見積り添削 結果】\n\n${review.summary}\n\n` +
+        `ご不明点があれば、こちらのトークにご返信ください。`,
+    });
+    review.approved = true;
+    res.send('<p>お客様に送信しました。このページは閉じて問題ありません。</p>');
+  } catch (err) {
+    console.error('❌ お客様への送信エラー:', err.message);
+    res.status(500).send('<p>送信に失敗しました。時間をおいて再度お試しください。</p>');
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
