@@ -47,7 +47,7 @@ const EXPERT_LINE_USER_ID = process.env.EXPERT_LINE_USER_ID;
 // 承認リンク・PDFリンクの組み立てに使うベースURL(Renderの公開URL)
 const BASE_URL = process.env.BASE_URL || 'https://estimate-review-stripe.onrender.com';
 // 添削済みPDFの日本語文字埋め込みに使うフォント(IPAゴシック、再配布可)
-const FONT_PATH = path.join(__dirname, 'fonts', 'ipag.ttf');
+const FONT_PATH = path.join(__dirname, 'ipag.ttf'); // フォントはリポジトリのルート直下に配置されている
 // 生成した添削済みPDFの保存先
 const GENERATED_DIR = path.join(__dirname, 'generated');
 fs.mkdirSync(GENERATED_DIR, { recursive: true });
