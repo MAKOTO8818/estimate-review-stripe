@@ -13,7 +13,12 @@
  * 8. 元のPDFに直接、色付け・番号マーカーを書き込み + 詳細一覧ページを追加 -> pdfAnnotate.js
  * 9. 専門家(管理者)のLINEに、添削済みPDFの確認依頼を通知
  * 10. 専門家が確認画面で承認 -> お客様のLINEに「添削済みPDFのリンク + 簡単な文章」を送信
- *     (確認画面では、専門家自身が書き込んだPDFをアップロードして差し替えることもできる)
+ *
+ * 注意:
+ * - 「初回利用者かどうか」の永続的な判定、承認待ちレビューの永続化、
+ *   生成済みPDFの永続保存は、いずれもデータベース/永続ストレージが必要。
+ *   ここではメモリ上のMap/Set・ローカルファイルで代用している(サーバー再起動で消える)。
+ *   本番運用でアクセスが増える場合は、DB(例: Postgres)やS3等のストレージに置き換えること。
  */
 
 require('dotenv').config();
@@ -32,12 +37,22 @@ const { annotatePdf } = require('./pdfAnnotate');
 const app = express();
 const PORT = process.env.PORT || 4242;
 
+// 「一式」注意書き(お客様が利用前に必ず目にするよう、案内文・受付確認メッセージの両方に挿入する)
+const LUMP_SUM_WARNING =
+  '【ご利用前の注意】内訳が「一式」とだけ記載され、数量・単価の内訳がない項目は、AIが金額の妥当性を判断できません。' +
+  'より正確な添削のためには、できる限り数量・単価の内訳が記載された見積書をご用意ください。';
+
+// 専門家(最終確認者)自身のLINEユーザーID。ここに承認依頼の通知が届く。
 const EXPERT_LINE_USER_ID = process.env.EXPERT_LINE_USER_ID;
+// 承認リンク・PDFリンクの組み立てに使うベースURL(Renderの公開URL)
 const BASE_URL = process.env.BASE_URL || 'https://estimate-review-stripe.onrender.com';
-const FONT_PATH = path.join(__dirname, 'ipag.ttf');
+// 添削済みPDFの日本語文字埋め込みに使うフォント(IPAゴシック、再配布可)
+const FONT_PATH = path.join(__dirname, 'fonts', 'ipag.ttf');
+// 生成した添削済みPDFの保存先
 const GENERATED_DIR = path.join(__dirname, 'generated');
 fs.mkdirSync(GENERATED_DIR, { recursive: true });
 
+// 添削済みPDFを配信する静的ルート
 app.use('/files', express.static(GENERATED_DIR));
 
 // 専門家が「自分で書き込んだPDF」をアップロードするための設定
@@ -53,6 +68,7 @@ const upload = multer({
   },
 });
 
+// 初回利用者かどうかの判定用(本番ではDBに置き換える)
 const seenLineUserIds = new Set();
 function isFirstTimeUser(lineUserId) {
   return !seenLineUserIds.has(lineUserId);
@@ -61,6 +77,8 @@ function markUserAsSeen(lineUserId) {
   seenLineUserIds.add(lineUserId);
 }
 
+// --- Stripe Webhook は署名検証のため「生のボディ」が必要 ---
+// 必ず express.json() より前、かつこのルート専用で raw を使うこと。
 app.post(
   '/stripe/webhook',
   express.raw({ type: 'application/json' }),
@@ -97,11 +115,13 @@ app.post(
   }
 );
 
+// 通常のJSONボディパーサーは、Stripe Webhookルートより後ろに置く
 app.use((req, res, next) => {
   if (req.path === '/line/webhook') return next();
   express.json()(req, res, next);
 });
 
+// --- LINEからの見積書受付 ---
 app.post('/line/webhook', lineMiddleware, async (req, res) => {
   try {
     const events = req.body.events || [];
@@ -120,6 +140,7 @@ async function handleLineEvent(event) {
   const replyToken = event.replyToken;
   const message = event.message;
 
+  // --- PDFファイルの受付 ---
   if (message.type === 'file' && message.fileName?.toLowerCase().endsWith('.pdf')) {
     const buffer = await downloadLineContent(message.id);
 
@@ -136,6 +157,7 @@ async function handleLineEvent(event) {
       return;
     }
 
+    // 元のPDFバッファを一時保存(添削書き込み・再抽出に使う)
     pendingEstimatePdfs.set(userId, buffer);
 
     const firstTime = isFirstTimeUser(userId);
@@ -146,7 +168,9 @@ async function handleLineEvent(event) {
       markUserAsSeen(userId);
       await lineClient.replyMessage(replyToken, {
         type: 'text',
-        text: `見積書を受け取りました（${pageCount}ページ）。${breakdown}\n無料でAI一次チェックを開始します。結果は最短7日以内にお送りします。`,
+        text:
+          `見積書を受け取りました（${pageCount}ページ）。${breakdown}\n無料でAI一次チェックを開始します。結果は最短7日以内にお送りします。\n\n` +
+          LUMP_SUM_WARNING,
       });
       await startEstimateReview({ lineUserId: userId, pageCount });
       return;
@@ -164,7 +188,9 @@ async function handleLineEvent(event) {
 
     await lineClient.replyMessage(replyToken, {
       type: 'text',
-      text: `見積書を受け取りました（${pageCount}ページ）。${breakdown}\nお支払いはこちらからお願いします:\n${url}`,
+      text:
+        `見積書を受け取りました（${pageCount}ページ）。${breakdown}\nお支払いはこちらからお願いします:\n${url}\n\n` +
+        LUMP_SUM_WARNING,
     });
     return;
   }
@@ -180,7 +206,9 @@ async function handleLineEvent(event) {
   if (message.type === 'text') {
     await lineClient.replyMessage(replyToken, {
       type: 'text',
-      text: 'ご利用ありがとうございます。見積書（PDF）を送信いただくと、自動でお見積り・添削を開始します。初回は1ページ目無料です。',
+      text:
+        'ご利用ありがとうございます。見積書（PDF）を送信いただくと、自動でお見積り・添削を開始します。初回は1ページ目無料です。\n\n' +
+        LUMP_SUM_WARNING,
     });
   }
 }
@@ -194,7 +222,11 @@ async function downloadLineContent(messageId) {
   return Buffer.concat(chunks);
 }
 
+// --- AI一次チェック〜添削PDF生成エージェントの起動口 ---
+// pendingEstimatePdfs: lineUserId -> 元PDFのBuffer の一時置き場(本番ではDB/ストレージに置き換える)
 const pendingEstimatePdfs = new Map();
+
+// 承認待ちレビュー: reviewId -> { lineUserId, pageCount, summary, findings, pdfFileName, approved }
 const pendingReviews = new Map();
 
 async function startEstimateReview({ lineUserId, pageCount }) {
@@ -275,6 +307,7 @@ function severityLabel(sev) {
   return { high: '🔴重要', medium: '🟠確認推奨', low: '🔵参考' }[sev] || '🟠確認推奨';
 }
 
+// --- 専門家向け 確認・承認画面 ---
 app.get('/admin/review/:id', (req, res) => {
   const review = pendingReviews.get(req.params.id);
   if (!review) {
