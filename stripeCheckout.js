@@ -17,6 +17,11 @@
  *   こうすることで、サーバーが再起動してキャッシュが消えても、
  *   Stripe側に残っている顧客情報から正しく復元できる(本番でDBを導入すれば、
  *   customerIdCacheの代わりにDBを使うよう差し替えればよい)。
+ *
+ *   検索には stripe.customers.search ではなく stripe.customers.list を使っている。
+ *   search は反映まで数秒〜数十秒のタイムラグがあり(作成直後は見つからないことがある)、
+ *   その間に重複して顧客が作られてしまう不具合があったため、即時反映される list に変更した。
+ *   (顧客数が非常に多くなった場合は、ここもDB管理に置き換える)
  */
 
 const Stripe = require('stripe');
@@ -38,15 +43,18 @@ async function findOrCreateCustomerForLineUser(lineUserId) {
     return customerIdCache.get(lineUserId);
   }
 
-  // metadataに line_user_id を仕込んだ顧客が既に存在しないか、Stripe側を検索する
-  const searchResult = await stripe.customers.search({
-    query: `metadata['line_user_id']:'${lineUserId}'`,
-  });
+  // metadataに line_user_id を仕込んだ顧客が既に存在しないか、Stripe側を確認する
+  // (customers.list は作成直後でも即座に反映されるため、customers.search のような
+  //  タイムラグによる重複作成が起きない)
+  let customerId = null;
+  for await (const customer of stripe.customers.list({ limit: 100 })) {
+    if (customer.metadata && customer.metadata.line_user_id === lineUserId) {
+      customerId = customer.id;
+      break;
+    }
+  }
 
-  let customerId;
-  if (searchResult.data.length > 0) {
-    customerId = searchResult.data[0].id;
-  } else {
+  if (!customerId) {
     const customer = await stripe.customers.create({
       metadata: { line_user_id: lineUserId },
     });
