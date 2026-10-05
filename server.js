@@ -14,19 +14,17 @@
  * 9. 専門家(管理者)のLINEに、添削済みPDFの確認依頼を通知
  * 10. 専門家が確認画面で承認 -> お客様のLINEに「添削済みPDFのリンク + 簡単な文章」を送信
  *
- * 注意:
- * - 「初回利用者かどうか」の永続的な判定、承認待ちレビューの永続化、
- *   生成済みPDFの永続保存は、いずれもデータベース/永続ストレージが必要。
- *   ここではメモリ上のMap/Set・ローカルファイルで代用している(サーバー再起動で消える)。
- *   本番運用でアクセスが増える場合は、DB(例: Postgres)やS3等のストレージに置き換えること。
+ * データの永続化について:
+ * 「初回利用者かどうか」の判定、承認待ちレビュー、受付中/添削済みPDF本体、
+ * 学習機能の元データ(行データ)は、すべてPostgreSQL(db.js)に保存している。
+ * これにより、Renderの再起動・再デプロイでデータが消えなくなった。
  */
 
 require('dotenv').config();
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 const express = require('express');
 const multer = require('multer');
+const { pool, initDb } = require('./db');
 const { calculatePrice } = require('./pricing');
 const { createEstimateReviewCheckoutSession, stripe } = require('./stripeCheckout');
 const { reviewEstimate } = require('./aiReview');
@@ -47,16 +45,11 @@ const EXPERT_LINE_USER_ID = process.env.EXPERT_LINE_USER_ID;
 // 承認リンク・PDFリンクの組み立てに使うベースURL(Renderの公開URL)
 const BASE_URL = process.env.BASE_URL || 'https://estimate-review-stripe.onrender.com';
 // 添削済みPDFの日本語文字埋め込みに使うフォント(IPAゴシック、再配布可)
+const path = require('path');
 const FONT_PATH = path.join(__dirname, 'ipag.ttf'); // フォントはリポジトリのルート直下に配置されている
-// 生成した添削済みPDFの保存先
-const GENERATED_DIR = path.join(__dirname, 'generated');
-fs.mkdirSync(GENERATED_DIR, { recursive: true });
-
-// 添削済みPDFを配信する静的ルート
-app.use('/files', express.static(GENERATED_DIR));
 
 // 専門家が「自分で書き込んだPDF」をアップロードするための設定
-// (メモリ上で受け取り、そのままgenerated/に書き込む。20MBまで、PDFのみ許可)
+// (メモリ上で受け取り、DBにそのまま書き込む。20MBまで、PDFのみ許可)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
@@ -68,13 +61,33 @@ const upload = multer({
   },
 });
 
-// 初回利用者かどうかの判定用(本番ではDBに置き換える)
-const seenLineUserIds = new Set();
-function isFirstTimeUser(lineUserId) {
-  return !seenLineUserIds.has(lineUserId);
+// --- 初回利用者かどうかの判定(DB永続化) ---
+async function isFirstTimeUser(lineUserId) {
+  const { rows } = await pool.query('SELECT 1 FROM seen_users WHERE line_user_id = $1', [lineUserId]);
+  return rows.length === 0;
 }
-function markUserAsSeen(lineUserId) {
-  seenLineUserIds.add(lineUserId);
+async function markUserAsSeen(lineUserId) {
+  await pool.query(
+    'INSERT INTO seen_users (line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING',
+    [lineUserId]
+  );
+}
+
+// --- 受付中の見積書PDF本体(DB永続化) ---
+async function savePendingPdf(lineUserId, buffer) {
+  await pool.query(
+    `INSERT INTO pending_estimate_pdfs (line_user_id, pdf_data)
+     VALUES ($1, $2)
+     ON CONFLICT (line_user_id) DO UPDATE SET pdf_data = EXCLUDED.pdf_data, created_at = now()`,
+    [lineUserId, buffer]
+  );
+}
+async function getPendingPdf(lineUserId) {
+  const { rows } = await pool.query(
+    'SELECT pdf_data FROM pending_estimate_pdfs WHERE line_user_id = $1',
+    [lineUserId]
+  );
+  return rows.length > 0 ? rows[0].pdf_data : null;
 }
 
 // --- Stripe Webhook は署名検証のため「生のボディ」が必要 ---
@@ -108,7 +121,9 @@ app.post(
         amountTotal: session.amount_total,
       });
 
-      startEstimateReview({ lineUserId: line_user_id, pageCount: Number(page_count) });
+      startEstimateReview({ lineUserId: line_user_id, pageCount: Number(page_count) }).catch((err) => {
+        console.error('❌ startEstimateReview(Webhook経由)でエラー:', err);
+      });
     }
 
     res.json({ received: true });
@@ -158,14 +173,14 @@ async function handleLineEvent(event) {
     }
 
     // 元のPDFバッファを一時保存(添削書き込み・再抽出に使う)
-    pendingEstimatePdfs.set(userId, buffer);
+    await savePendingPdf(userId, buffer);
 
-    const firstTime = isFirstTimeUser(userId);
+    const firstTime = await isFirstTimeUser(userId);
     const { amount, breakdown } = calculatePrice(pageCount, firstTime);
     console.log(breakdown);
 
     if (amount === 0) {
-      markUserAsSeen(userId);
+      await markUserAsSeen(userId);
       await lineClient.replyMessage(replyToken, {
         type: 'text',
         text:
@@ -184,7 +199,7 @@ async function handleLineEvent(event) {
       successUrl: process.env.CHECKOUT_SUCCESS_URL || 'https://example.com/thanks',
       cancelUrl: process.env.CHECKOUT_CANCEL_URL || 'https://example.com/cancelled',
     });
-    markUserAsSeen(userId);
+    await markUserAsSeen(userId);
 
     await lineClient.replyMessage(replyToken, {
       type: 'text',
@@ -222,15 +237,31 @@ async function downloadLineContent(messageId) {
   return Buffer.concat(chunks);
 }
 
+/**
+ * 見積りの行データ(学習機能の元データ)をDBに保存する。
+ * 今はまだ「貯めるだけ」の段階。将来ここから単価の統計を集計し、
+ * AIのチェック精度向上に使う。
+ */
+async function saveLineItemsForLearning(reviewId, pages) {
+  try {
+    for (const page of pages) {
+      for (const row of page.rows || []) {
+        await pool.query(
+          `INSERT INTO estimate_line_items (review_id, page, item_text, qty, unit, unit_price, amount)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [reviewId, page.pageNumber, row.item, row.qty, row.unit, row.unitPrice, row.amount]
+        );
+      }
+    }
+  } catch (err) {
+    // 学習データの保存に失敗しても、添削そのものは止めない
+    console.error('⚠️ 学習用データの保存に失敗しました:', err.message);
+  }
+}
+
 // --- AI一次チェック〜添削PDF生成エージェントの起動口 ---
-// pendingEstimatePdfs: lineUserId -> 元PDFのBuffer の一時置き場(本番ではDB/ストレージに置き換える)
-const pendingEstimatePdfs = new Map();
-
-// 承認待ちレビュー: reviewId -> { lineUserId, pageCount, summary, findings, pdfFileName, approved }
-const pendingReviews = new Map();
-
 async function startEstimateReview({ lineUserId, pageCount }) {
-  const pdfBuffer = pendingEstimatePdfs.get(lineUserId);
+  const pdfBuffer = await getPendingPdf(lineUserId);
   if (!pdfBuffer) {
     console.error(`⚠️ ${lineUserId} の見積書PDFが見つかりません。PDF受付時の保存処理を確認してください。`);
     return;
@@ -254,20 +285,25 @@ async function startEstimateReview({ lineUserId, pageCount }) {
     );
 
     const reviewId = crypto.randomUUID();
-    const pdfFileName = `${reviewId}.pdf`;
-    fs.writeFileSync(path.join(GENERATED_DIR, pdfFileName), annotatedBuffer);
 
-    pendingReviews.set(reviewId, {
-      lineUserId,
-      pageCount,
-      summary: result.summary,
-      findings: result.findings,
-      matchedCount,
-      unmatchedCount: unmatchedFindings.length,
-      pdfFileName,
-      approved: false,
-      replacedByExpert: false,
-    });
+    await pool.query(
+      `INSERT INTO pending_reviews
+         (id, line_user_id, page_count, summary, findings, matched_count, unmatched_count, pdf_data, approved, replaced_by_expert)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, false)`,
+      [
+        reviewId,
+        lineUserId,
+        pageCount,
+        result.summary,
+        JSON.stringify(result.findings),
+        matchedCount,
+        unmatchedFindings.length,
+        annotatedBuffer,
+      ]
+    );
+
+    // 学習機能の元データを蓄積(失敗しても添削フローは止めない)
+    await saveLineItemsForLearning(reviewId, pages);
 
     if (EXPERT_LINE_USER_ID) {
       await lineClient.pushMessage(EXPERT_LINE_USER_ID, {
@@ -307,9 +343,38 @@ function severityLabel(sev) {
   return { high: '🔴重要', medium: '🟠確認推奨', low: '🔵参考' }[sev] || '🟠確認推奨';
 }
 
+async function getReview(reviewId) {
+  const { rows } = await pool.query('SELECT * FROM pending_reviews WHERE id = $1', [reviewId]);
+  if (rows.length === 0) return null;
+  const r = rows[0];
+  return {
+    id: r.id,
+    lineUserId: r.line_user_id,
+    pageCount: r.page_count,
+    summary: r.summary,
+    findings: r.findings || [],
+    matchedCount: r.matched_count,
+    unmatchedCount: r.unmatched_count,
+    pdfData: r.pdf_data,
+    approved: r.approved,
+    replacedByExpert: r.replaced_by_expert,
+  };
+}
+
+// --- 添削済みPDFの配信(DBから直接ストリーミング。ローカルディスクを使わないため再起動で消えない) ---
+app.get('/files/:filename', async (req, res) => {
+  const reviewId = req.params.filename.replace(/\.pdf$/i, '');
+  const review = await getReview(reviewId);
+  if (!review || !review.pdfData) {
+    return res.status(404).send('ファイルが見つかりません。');
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.send(review.pdfData);
+});
+
 // --- 専門家向け 確認・承認画面 ---
-app.get('/admin/review/:id', (req, res) => {
-  const review = pendingReviews.get(req.params.id);
+app.get('/admin/review/:id', async (req, res) => {
+  const review = await getReview(req.params.id);
   if (!review) {
     return res.status(404).send('<p>このレビューは見つかりません。URLが正しいかご確認ください。</p>');
   }
@@ -317,7 +382,7 @@ app.get('/admin/review/:id', (req, res) => {
     return res.send('<p>このレビューは既にお客様へ送信済みです。</p>');
   }
 
-  const pdfUrl = `${BASE_URL}/files/${review.pdfFileName}`;
+  const pdfUrl = `${BASE_URL}/files/${review.id}.pdf`;
   const findingsHtml = review.findings
     .map(
       (f, i) => `
@@ -384,8 +449,8 @@ app.get('/admin/review/:id', (req, res) => {
 });
 
 app.post('/admin/review/:id/upload', (req, res) => {
-  upload.single('pdf')(req, res, (err) => {
-    const review = pendingReviews.get(req.params.id);
+  upload.single('pdf')(req, res, async (err) => {
+    const review = await getReview(req.params.id);
     if (!review) {
       return res.status(404).send('<p>このレビューは見つかりません。</p>');
     }
@@ -400,15 +465,17 @@ app.post('/admin/review/:id/upload', (req, res) => {
       return res.status(400).send(`<p>ファイルが選択されていません。</p><p><a href="/admin/review/${req.params.id}">戻る</a></p>`);
     }
 
-    fs.writeFileSync(path.join(GENERATED_DIR, review.pdfFileName), req.file.buffer);
-    review.replacedByExpert = true;
+    await pool.query(
+      'UPDATE pending_reviews SET pdf_data = $1, replaced_by_expert = true WHERE id = $2',
+      [req.file.buffer, req.params.id]
+    );
 
     res.redirect(`/admin/review/${req.params.id}`);
   });
 });
 
 app.post('/admin/review/:id/approve', async (req, res) => {
-  const review = pendingReviews.get(req.params.id);
+  const review = await getReview(req.params.id);
   if (!review) {
     return res.status(404).send('<p>このレビューは見つかりません。</p>');
   }
@@ -416,7 +483,7 @@ app.post('/admin/review/:id/approve', async (req, res) => {
     return res.send('<p>既に送信済みです。</p>');
   }
 
-  const pdfUrl = `${BASE_URL}/files/${review.pdfFileName}`;
+  const pdfUrl = `${BASE_URL}/files/${review.id}.pdf`;
 
   try {
     await lineClient.pushMessage(review.lineUserId, {
@@ -427,7 +494,7 @@ app.post('/admin/review/:id/approve', async (req, res) => {
         `添削済みPDFはこちら:\n${pdfUrl}\n\n` +
         `ご不明点があれば、こちらのトークにご返信ください。`,
     });
-    review.approved = true;
+    await pool.query('UPDATE pending_reviews SET approved = true WHERE id = $1', [review.id]);
     res.send('<p>お客様に送信しました。このページは閉じて問題ありません。</p>');
   } catch (err) {
     console.error('❌ お客様への送信エラー:', err.message);
@@ -435,6 +502,13 @@ app.post('/admin/review/:id/approve', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('❌ DB初期化に失敗したため、サーバーを起動できません:', err);
+    process.exit(1);
+  });
