@@ -12,25 +12,24 @@
  *   Stripeが自動的に「保存済みのカードを選ぶ/新しいカードを追加する」画面を出してくれる。
  *   (カード番号そのものはこちらのサーバーには一切保存しない)
  *
- *   顧客IDは、まずメモリ上のキャッシュ(customerIdCache)を見て、
- *   無ければStripe側をmetadataで検索し、それでも無ければ新規作成する。
- *   こうすることで、サーバーが再起動してキャッシュが消えても、
- *   Stripe側に残っている顧客情報から正しく復元できる(本番でDBを導入すれば、
- *   customerIdCacheの代わりにDBを使うよう差し替えればよい)。
+ *   顧客IDの対応(lineUserId -> Stripe Customer ID)は、以下の順で解決する:
+ *     1. メモリ上のキャッシュ(customerIdCache。同一プロセス内の高速化のみ)
+ *     2. DB(stripe_customersテーブル。再起動しても消えない正の情報源)
+ *     3. (DBにも無い場合のみ)Stripe側をmetadataで検索し、無ければ新規作成してDBに保存
  *
  *   検索には stripe.customers.search ではなく stripe.customers.list を使っている。
  *   search は反映まで数秒〜数十秒のタイムラグがあり(作成直後は見つからないことがある)、
  *   その間に重複して顧客が作られてしまう不具合があったため、即時反映される list に変更した。
- *   (顧客数が非常に多くなった場合は、ここもDB管理に置き換える)
  */
 
 const Stripe = require('stripe');
+const { pool } = require('./db');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2025-08-27.basil',
 });
 
-// lineUserId -> Stripe Customer ID のキャッシュ(再起動で消えてもStripe側の検索でフォールバックする)
+// lineUserId -> Stripe Customer ID のキャッシュ(同一プロセス内のみ有効。再起動したらDBから復元する)
 const customerIdCache = new Map();
 
 /**
@@ -43,9 +42,19 @@ async function findOrCreateCustomerForLineUser(lineUserId) {
     return customerIdCache.get(lineUserId);
   }
 
-  // metadataに line_user_id を仕込んだ顧客が既に存在しないか、Stripe側を確認する
-  // (customers.list は作成直後でも即座に反映されるため、customers.search のような
-  //  タイムラグによる重複作成が起きない)
+  // 1. DBを確認(これが正の情報源。再起動しても消えない)
+  const { rows } = await pool.query(
+    'SELECT stripe_customer_id FROM stripe_customers WHERE line_user_id = $1',
+    [lineUserId]
+  );
+  if (rows.length > 0) {
+    const customerId = rows[0].stripe_customer_id;
+    customerIdCache.set(lineUserId, customerId);
+    return customerId;
+  }
+
+  // 2. DBに無い場合のみ、Stripe側をmetadataで検索する
+  //    (DB導入前に作られた顧客や、何らかの理由でDB書き込みが失敗したケースの救済)
   let customerId = null;
   for await (const customer of stripe.customers.list({ limit: 100 })) {
     if (customer.metadata && customer.metadata.line_user_id === lineUserId) {
@@ -60,6 +69,14 @@ async function findOrCreateCustomerForLineUser(lineUserId) {
     });
     customerId = customer.id;
   }
+
+  // 3. DBに保存して、次回以降はDBだけで解決できるようにする
+  await pool.query(
+    `INSERT INTO stripe_customers (line_user_id, stripe_customer_id)
+     VALUES ($1, $2)
+     ON CONFLICT (line_user_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id`,
+    [lineUserId, customerId]
+  );
 
   customerIdCache.set(lineUserId, customerId);
   return customerId;
