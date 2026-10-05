@@ -4,6 +4,19 @@
  * 「都度金額が変わる決済リンク」は、Payment Links ではなく
  * Checkout Sessions + line_items[].price_data で作るのが Stripe 推奨の方法。
  * (Payment Links は事前に作った Price に紐づくため、金額を毎回変えるのに不向き)
+ *
+ * カード情報の保存・再利用について:
+ *   LINEのユーザーIDごとにStripeの「顧客(Customer)」を作成し、
+ *   決済時に setup_future_usage を指定することで、カード情報をStripe側に安全に保存する。
+ *   2回目以降は同じCustomerでCheckout Sessionを作るだけで、
+ *   Stripeが自動的に「保存済みのカードを選ぶ/新しいカードを追加する」画面を出してくれる。
+ *   (カード番号そのものはこちらのサーバーには一切保存しない)
+ *
+ *   顧客IDは、まずメモリ上のキャッシュ(customerIdCache)を見て、
+ *   無ければStripe側をmetadataで検索し、それでも無ければ新規作成する。
+ *   こうすることで、サーバーが再起動してキャッシュが消えても、
+ *   Stripe側に残っている顧客情報から正しく復元できる(本番でDBを導入すれば、
+ *   customerIdCacheの代わりにDBを使うよう差し替えればよい)。
  */
 
 const Stripe = require('stripe');
@@ -11,6 +24,38 @@ const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2025-08-27.basil',
 });
+
+// lineUserId -> Stripe Customer ID のキャッシュ(再起動で消えてもStripe側の検索でフォールバックする)
+const customerIdCache = new Map();
+
+/**
+ * LINEのユーザーIDに対応するStripe顧客を取得する。いなければ新規作成する。
+ * @param {string} lineUserId
+ * @returns {Promise<string>} Stripe Customer ID
+ */
+async function findOrCreateCustomerForLineUser(lineUserId) {
+  if (customerIdCache.has(lineUserId)) {
+    return customerIdCache.get(lineUserId);
+  }
+
+  // metadataに line_user_id を仕込んだ顧客が既に存在しないか、Stripe側を検索する
+  const searchResult = await stripe.customers.search({
+    query: `metadata['line_user_id']:'${lineUserId}'`,
+  });
+
+  let customerId;
+  if (searchResult.data.length > 0) {
+    customerId = searchResult.data[0].id;
+  } else {
+    const customer = await stripe.customers.create({
+      metadata: { line_user_id: lineUserId },
+    });
+    customerId = customer.id;
+  }
+
+  customerIdCache.set(lineUserId, customerId);
+  return customerId;
+}
 
 /**
  * @param {object} params
@@ -35,11 +80,16 @@ async function createEstimateReviewCheckoutSession({
     throw new Error('amount が0円以下です。無料枠のみの場合は決済セッションを作成しないでください。');
   }
 
+  const customerId = await findOrCreateCustomerForLineUser(lineUserId);
+
   const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      managed_payments: { enabled: false },    
-    
-   
+    mode: 'payment',
+    managed_payments: { enabled: false },
+    customer: customerId,
+    payment_intent_data: {
+      // このお客様の今後の決済のためにカードを保存する(Stripeが安全に保管。こちらのサーバーには残らない)
+      setup_future_usage: 'off_session',
+    },
     line_items: [
       {
         quantity: 1,
@@ -65,4 +115,4 @@ async function createEstimateReviewCheckoutSession({
   return { id: session.id, url: session.url };
 }
 
-module.exports = { createEstimateReviewCheckoutSession, stripe };
+module.exports = { createEstimateReviewCheckoutSession, findOrCreateCustomerForLineUser, stripe };
