@@ -457,10 +457,6 @@ app.get('/admin/review/:id', async (req, res) => {
   if (!review) {
     return res.status(404).send('<p>このレビューは見つかりません。URLが正しいかご確認ください。</p>');
   }
-  if (review.approved) {
-    return res.send('<p>このレビューは既にお客様へ送信済みです。</p>');
-  }
-
   const pdfUrl = `${BASE_URL}/files/${review.id}.pdf`;
   const findingsHtml = review.findings
     .map(
@@ -502,6 +498,10 @@ app.get('/admin/review/:id', async (req, res) => {
           : ''
       }
 
+      ${
+        review.approved
+          ? `<p style="color:#06c755; font-weight:bold; background:#eafaf0; padding:12px; border-radius:8px;">✓ このレビューは既にお客様へ送信済みです。上の「添削済みPDFを開く」のリンクは、いつでもこのまま開けます。</p>`
+          : `
       <div style="border:1px solid #ddd; border-radius:8px; padding:16px; margin: 20px 0;">
         <h3 style="margin-top:0;">ご自身でPDFに書き込みを追加する場合</h3>
         <p style="color:#666; font-size:0.9em;">
@@ -522,6 +522,8 @@ app.get('/admin/review/:id', async (req, res) => {
           この内容でお客様に送信する
         </button>
       </form>
+      `
+      }
     </body>
     </html>
   `);
