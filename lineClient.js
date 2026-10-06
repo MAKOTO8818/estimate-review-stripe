@@ -1,28 +1,35 @@
 /**
  * LINE Messaging API クライアント設定
  *
- * .env の LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET を使って
- * @line/bot-sdk のクライアントと署名検証ミドルウェアを組み立てる。
+ * マルチテナント化により、会社(テナント)ごとに別々のLINE公式アカウント
+ * (別々の channelSecret / channelAccessToken)を使うようになったため、
+ * 固定の1クライアントではなく、テナントの設定を渡してその場でクライアントと
+ * 署名検証ミドルウェアを組み立てる関数を提供する。
  *
  * 前提: npm install @line/bot-sdk
  */
 
 const line = require('@line/bot-sdk');
 
-const lineConfig = {
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
-};
-
-if (!lineConfig.channelAccessToken || !lineConfig.channelSecret) {
-  console.warn(
-    '⚠️ LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET が.envに設定されていません。LINE連携は動作しません。'
-  );
+/**
+ * テナント(tenants テーブルの1行)から、そのテナント用のLINEクライアントを作る。
+ * @param {{ line_channel_access_token: string, line_channel_secret: string }} tenant
+ * @returns {import('@line/bot-sdk').Client}
+ */
+function clientForTenant(tenant) {
+  return new line.Client({
+    channelAccessToken: tenant.line_channel_access_token,
+    channelSecret: tenant.line_channel_secret,
+  });
 }
 
-const client = new line.Client(lineConfig);
+/**
+ * テナント(tenants テーブルの1行)から、そのテナント用の署名検証ミドルウェアを作る。
+ * (LINEからのWebhookが、本当にそのテナントのLINEチャネルから送られたものかを検証する)
+ * @param {{ line_channel_secret: string }} tenant
+ */
+function middlewareForTenant(tenant) {
+  return line.middleware({ channelSecret: tenant.line_channel_secret });
+}
 
-// express.Router() にそのままマウントできる署名検証ミドルウェア
-const middleware = line.middleware(lineConfig);
-
-module.exports = { client, middleware, lineConfig };
+module.exports = { clientForTenant, middlewareForTenant };
