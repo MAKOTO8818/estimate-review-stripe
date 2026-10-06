@@ -1,8 +1,8 @@
 /**
- * AI見積り添削 - 自動化サーバー
+ * AI見積り添削 - 自動化サーバー(マルチテナント対応版)
  *
  * 流れ:
- * 1. LINEで見積書(PDF)を受付             -> POST /line/webhook
+ * 1. LINEで見積書(PDF)を受付             -> POST /line/webhook (デフォルトテナント) または /line/webhook/:slug (他テナント)
  * 2. ページ数から金額を自動計算            -> pricing.js
  * 3. 無料枠のみなら決済不要、即添削開始
  *    有料分があればCheckout Session発行    -> stripeCheckout.js
@@ -14,6 +14,15 @@
  * 9. 専門家(管理者)のLINEに、添削済みPDFの確認依頼を通知
  * 10. 専門家が確認画面で承認 -> お客様のLINEに「添削済みPDFのリンク + 簡単な文章」を送信
  *
+ * マルチテナント化について:
+ * 「tenants」テーブルが会社(テナント)ごとの設定(LINEチャネル情報・担当者LINE ID等)を持つ。
+ * これまでの単一事業(建設顧問セカンドオピニオン)は、起動時に自動で
+ * slug='default' のテナントとして登録される(db.js参照)。
+ * 既存のLINE Webhook URL(/line/webhook)はそのまま使えるようにしてあるので、
+ * 既存のLINE公式アカウント側の設定変更は不要。
+ * 新しい会社を追加する場合は、その会社専用のLINE公式アカウントを用意してもらい、
+ * Webhook URLを /line/webhook/<その会社のslug> に設定してもらう。
+ *
  * データの永続化について:
  * 「初回利用者かどうか」の判定、承認待ちレビュー、受付中/添削済みPDF本体、
  * 学習機能の元データ(行データ)は、すべてPostgreSQL(db.js)に保存している。
@@ -22,13 +31,15 @@
 
 require('dotenv').config();
 const crypto = require('crypto');
+const path = require('path');
 const express = require('express');
 const multer = require('multer');
+const line = require('@line/bot-sdk');
 const { pool, initDb } = require('./db');
 const { calculatePrice } = require('./pricing');
 const { createEstimateReviewCheckoutSession, stripe } = require('./stripeCheckout');
 const { reviewEstimate } = require('./aiReview');
-const { client: lineClient, middleware: lineMiddleware } = require('./lineClient');
+const { clientForTenant, middlewareForTenant } = require('./lineClient');
 const { extractStructuredPdf } = require('./pdfRows');
 const { annotatePdf } = require('./pdfAnnotate');
 
@@ -40,13 +51,13 @@ const LUMP_SUM_WARNING =
   '【ご利用前の注意】内訳が「一式」とだけ記載され、数量・単価の内訳がない項目は、AIが金額の妥当性を判断できません。' +
   'より正確な添削のためには、できる限り数量・単価の内訳が記載された見積書をご用意ください。';
 
-// 専門家(最終確認者)自身のLINEユーザーID。ここに承認依頼の通知が届く。
-const EXPERT_LINE_USER_ID = process.env.EXPERT_LINE_USER_ID;
 // 承認リンク・PDFリンクの組み立てに使うベースURL(Renderの公開URL)
 const BASE_URL = process.env.BASE_URL || 'https://estimate-review-stripe.onrender.com';
 // 添削済みPDFの日本語文字埋め込みに使うフォント(IPAゴシック、再配布可)
-const path = require('path');
 const FONT_PATH = path.join(__dirname, 'ipag.ttf'); // フォントはリポジトリのルート直下に配置されている
+// テナント管理用の簡易エンドポイント(/admin/tenants)を保護するための合言葉。
+// 本格的なセルフサインアップ画面ができるまでの、暫定的なテナント追加手段。
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 // 専門家が「自分で書き込んだPDF」をアップロードするための設定
 // (メモリ上で受け取り、DBにそのまま書き込む。20MBまで、PDFのみ許可)
@@ -61,31 +72,44 @@ const upload = multer({
   },
 });
 
-// --- 初回利用者かどうかの判定(DB永続化) ---
-async function isFirstTimeUser(lineUserId) {
-  const { rows } = await pool.query('SELECT 1 FROM seen_users WHERE line_user_id = $1', [lineUserId]);
+// --- テナント(会社)関連 ---
+async function getTenantBySlug(slug) {
+  const { rows } = await pool.query('SELECT * FROM tenants WHERE slug = $1 AND is_active = true', [slug]);
+  return rows[0] || null;
+}
+async function getTenantById(tenantId) {
+  const { rows } = await pool.query('SELECT * FROM tenants WHERE id = $1', [tenantId]);
+  return rows[0] || null;
+}
+
+// --- 初回利用者かどうかの判定(テナント・DB永続化) ---
+async function isFirstTimeUser(tenantId, lineUserId) {
+  const { rows } = await pool.query(
+    'SELECT 1 FROM seen_users WHERE tenant_id = $1 AND line_user_id = $2',
+    [tenantId, lineUserId]
+  );
   return rows.length === 0;
 }
-async function markUserAsSeen(lineUserId) {
+async function markUserAsSeen(tenantId, lineUserId) {
   await pool.query(
-    'INSERT INTO seen_users (line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING',
-    [lineUserId]
+    'INSERT INTO seen_users (tenant_id, line_user_id) VALUES ($1, $2) ON CONFLICT (tenant_id, line_user_id) DO NOTHING',
+    [tenantId, lineUserId]
   );
 }
 
-// --- 受付中の見積書PDF本体(DB永続化) ---
-async function savePendingPdf(lineUserId, buffer) {
+// --- 受付中の見積書PDF本体(テナント・DB永続化) ---
+async function savePendingPdf(tenantId, lineUserId, buffer) {
   await pool.query(
-    `INSERT INTO pending_estimate_pdfs (line_user_id, pdf_data)
-     VALUES ($1, $2)
-     ON CONFLICT (line_user_id) DO UPDATE SET pdf_data = EXCLUDED.pdf_data, created_at = now()`,
-    [lineUserId, buffer]
+    `INSERT INTO pending_estimate_pdfs (tenant_id, line_user_id, pdf_data)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (tenant_id, line_user_id) DO UPDATE SET pdf_data = EXCLUDED.pdf_data, created_at = now()`,
+    [tenantId, lineUserId, buffer]
   );
 }
-async function getPendingPdf(lineUserId) {
+async function getPendingPdf(tenantId, lineUserId) {
   const { rows } = await pool.query(
-    'SELECT pdf_data FROM pending_estimate_pdfs WHERE line_user_id = $1',
-    [lineUserId]
+    'SELECT pdf_data FROM pending_estimate_pdfs WHERE tenant_id = $1 AND line_user_id = $2',
+    [tenantId, lineUserId]
   );
   return rows.length > 0 ? rows[0].pdf_data : null;
 }
@@ -112,16 +136,24 @@ app.post(
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
-      const { line_user_id, page_count, is_first_time_user } = session.metadata || {};
+      const { tenant_id, line_user_id, page_count, is_first_time_user } = session.metadata || {};
 
       console.log('✅ 決済完了:', {
+        tenantId: tenant_id,
         lineUserId: line_user_id,
         pageCount: page_count,
         isFirstTimeUser: is_first_time_user,
         amountTotal: session.amount_total,
       });
 
-      startEstimateReview({ lineUserId: line_user_id, pageCount: Number(page_count) }).catch((err) => {
+      (async () => {
+        const tenant = await getTenantById(tenant_id);
+        if (!tenant) {
+          console.error(`⚠️ 決済完了Webhookのtenant_id(${tenant_id})に対応するテナントが見つかりません。`);
+          return;
+        }
+        await startEstimateReview({ tenant, lineUserId: line_user_id, pageCount: Number(page_count) });
+      })().catch((err) => {
         console.error('❌ startEstimateReview(Webhook経由)でエラー:', err);
       });
     }
@@ -130,25 +162,65 @@ app.post(
   }
 );
 
-// 通常のJSONボディパーサーは、Stripe Webhookルートより後ろに置く
+// 通常のJSONボディパーサーは、Stripe Webhook・LINE Webhookルートより後ろに置く
+// (LINE側は署名検証のため生のボディが必要なので、/line/webhook* はここで除外する)
 app.use((req, res, next) => {
-  if (req.path === '/line/webhook') return next();
+  if (req.path.startsWith('/line/webhook')) return next();
   express.json()(req, res, next);
 });
 
-// --- LINEからの見積書受付 ---
-app.post('/line/webhook', lineMiddleware, async (req, res) => {
+/**
+ * LINE Webhookの共通処理。テナントが確定した後に呼ばれる。
+ * (署名検証はこの前段で、テナントごとのchannelSecretを使って既に完了している)
+ */
+async function processLineWebhookBody(req, res, tenant) {
+  const lineClient = clientForTenant(tenant);
   try {
     const events = req.body.events || [];
-    await Promise.all(events.map(handleLineEvent));
+    await Promise.all(events.map((event) => handleLineEvent(event, tenant, lineClient)));
     res.json({ status: 'ok' });
   } catch (err) {
     console.error('❌ LINE Webhook処理エラー:', err);
     res.status(500).json({ error: err.message });
   }
+}
+
+// --- LINEからの見積書受付(デフォルトテナント。既存のLINE公式アカウントのWebhook URLはこのまま) ---
+app.post('/line/webhook', async (req, res) => {
+  const tenant = await getTenantBySlug('default');
+  if (!tenant) {
+    console.error('⚠️ デフォルトテナントが見つかりません。DB初期化が完了しているか確認してください。');
+    return res.status(500).end();
+  }
+  middlewareForTenant(tenant)(req, res, (err) => {
+    if (err) {
+      console.error('⚠️ LINE署名検証エラー(default):', err.message);
+      return res.status(400).send('signature validation failed');
+    }
+    processLineWebhookBody(req, res, tenant).catch((err2) => {
+      console.error('❌ LINE Webhook処理エラー:', err2);
+    });
+  });
 });
 
-async function handleLineEvent(event) {
+// --- LINEからの見積書受付(追加テナント用。URLにそのテナントのslugを含める) ---
+app.post('/line/webhook/:slug', async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) {
+    return res.status(404).send('このテナントは見つかりません。');
+  }
+  middlewareForTenant(tenant)(req, res, (err) => {
+    if (err) {
+      console.error(`⚠️ LINE署名検証エラー(${req.params.slug}):`, err.message);
+      return res.status(400).send('signature validation failed');
+    }
+    processLineWebhookBody(req, res, tenant).catch((err2) => {
+      console.error('❌ LINE Webhook処理エラー:', err2);
+    });
+  });
+});
+
+async function handleLineEvent(event, tenant, lineClient) {
   if (event.type !== 'message') return;
 
   const userId = event.source.userId;
@@ -157,7 +229,7 @@ async function handleLineEvent(event) {
 
   // --- PDFファイルの受付 ---
   if (message.type === 'file' && message.fileName?.toLowerCase().endsWith('.pdf')) {
-    const buffer = await downloadLineContent(message.id);
+    const buffer = await downloadLineContent(lineClient, message.id);
 
     let pageCount;
     try {
@@ -173,25 +245,27 @@ async function handleLineEvent(event) {
     }
 
     // 元のPDFバッファを一時保存(添削書き込み・再抽出に使う)
-    await savePendingPdf(userId, buffer);
+    await savePendingPdf(tenant.id, userId, buffer);
 
-    const firstTime = await isFirstTimeUser(userId);
+    const firstTime = await isFirstTimeUser(tenant.id, userId);
     const { amount, breakdown } = calculatePrice(pageCount, firstTime);
     console.log(breakdown);
 
     if (amount === 0) {
-      await markUserAsSeen(userId);
+      await markUserAsSeen(tenant.id, userId);
       await lineClient.replyMessage(replyToken, {
         type: 'text',
         text:
           `見積書を受け取りました（${pageCount}ページ）。${breakdown}\n無料でAI一次チェックを開始します。結果は最短7日以内にお送りします。\n\n` +
           LUMP_SUM_WARNING,
       });
-      await startEstimateReview({ lineUserId: userId, pageCount });
+      await startEstimateReview({ tenant, lineUserId: userId, pageCount });
       return;
     }
 
     const { url } = await createEstimateReviewCheckoutSession({
+      tenantId: tenant.id,
+      tenantName: tenant.company_name,
       amount,
       lineUserId: userId,
       pageCount,
@@ -199,7 +273,7 @@ async function handleLineEvent(event) {
       successUrl: process.env.CHECKOUT_SUCCESS_URL || 'https://example.com/thanks',
       cancelUrl: process.env.CHECKOUT_CANCEL_URL || 'https://example.com/cancelled',
     });
-    await markUserAsSeen(userId);
+    await markUserAsSeen(tenant.id, userId);
 
     await lineClient.replyMessage(replyToken, {
       type: 'text',
@@ -228,7 +302,7 @@ async function handleLineEvent(event) {
   }
 }
 
-async function downloadLineContent(messageId) {
+async function downloadLineContent(lineClient, messageId) {
   const stream = await lineClient.getMessageContent(messageId);
   const chunks = [];
   for await (const chunk of stream) {
@@ -240,16 +314,16 @@ async function downloadLineContent(messageId) {
 /**
  * 見積りの行データ(学習機能の元データ)をDBに保存する。
  * 今はまだ「貯めるだけ」の段階。将来ここから単価の統計を集計し、
- * AIのチェック精度向上に使う。
+ * AIのチェック精度向上に使う。テナントごとに分離して蓄積する。
  */
-async function saveLineItemsForLearning(reviewId, pages) {
+async function saveLineItemsForLearning(tenantId, reviewId, pages) {
   try {
     for (const page of pages) {
       for (const row of page.rows || []) {
         await pool.query(
-          `INSERT INTO estimate_line_items (review_id, page, item_text, qty, unit, unit_price, amount)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [reviewId, page.pageNumber, row.item, row.qty, row.unit, row.unitPrice, row.amount]
+          `INSERT INTO estimate_line_items (tenant_id, review_id, page, item_text, qty, unit, unit_price, amount)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [tenantId, reviewId, page.pageNumber, row.item, row.qty, row.unit, row.unitPrice, row.amount]
         );
       }
     }
@@ -260,17 +334,20 @@ async function saveLineItemsForLearning(reviewId, pages) {
 }
 
 // --- AI一次チェック〜添削PDF生成エージェントの起動口 ---
-async function startEstimateReview({ lineUserId, pageCount }) {
-  const pdfBuffer = await getPendingPdf(lineUserId);
+async function startEstimateReview({ tenant, lineUserId, pageCount }) {
+  const pdfBuffer = await getPendingPdf(tenant.id, lineUserId);
   if (!pdfBuffer) {
-    console.error(`⚠️ ${lineUserId} の見積書PDFが見つかりません。PDF受付時の保存処理を確認してください。`);
+    console.error(`⚠️ [${tenant.slug}] ${lineUserId} の見積書PDFが見つかりません。PDF受付時の保存処理を確認してください。`);
     return;
   }
+
+  const lineClient = clientForTenant(tenant);
 
   try {
     const { pages } = await extractStructuredPdf(pdfBuffer);
     const result = await reviewEstimate(pages);
     console.log('🤖 AI一次チェック完了:', {
+      tenant: tenant.slug,
       lineUserId,
       pageCount,
       summary: result.summary,
@@ -288,10 +365,11 @@ async function startEstimateReview({ lineUserId, pageCount }) {
 
     await pool.query(
       `INSERT INTO pending_reviews
-         (id, line_user_id, page_count, summary, findings, matched_count, unmatched_count, pdf_data, approved, replaced_by_expert)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, false)`,
+         (id, tenant_id, line_user_id, page_count, summary, findings, matched_count, unmatched_count, pdf_data, approved, replaced_by_expert)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, false)`,
       [
         reviewId,
+        tenant.id,
         lineUserId,
         pageCount,
         result.summary,
@@ -303,10 +381,10 @@ async function startEstimateReview({ lineUserId, pageCount }) {
     );
 
     // 学習機能の元データを蓄積(失敗しても添削フローは止めない)
-    await saveLineItemsForLearning(reviewId, pages);
+    await saveLineItemsForLearning(tenant.id, reviewId, pages);
 
-    if (EXPERT_LINE_USER_ID) {
-      await lineClient.pushMessage(EXPERT_LINE_USER_ID, {
+    if (tenant.expert_line_user_id) {
+      await lineClient.pushMessage(tenant.expert_line_user_id, {
         type: 'text',
         text:
           `【添削結果 確認依頼】\n` +
@@ -316,12 +394,12 @@ async function startEstimateReview({ lineUserId, pageCount }) {
           `${BASE_URL}/admin/review/${reviewId}`,
       });
     } else {
-      console.error('⚠️ EXPERT_LINE_USER_ID が未設定のため、専門家への通知をスキップしました。');
+      console.error(`⚠️ [${tenant.slug}] expert_line_user_id が未設定のため、専門家への通知をスキップしました。`);
     }
   } catch (err) {
     console.error('❌ AI一次チェック/PDF添削でエラー:', err);
-    if (EXPERT_LINE_USER_ID) {
-      await lineClient.pushMessage(EXPERT_LINE_USER_ID, {
+    if (tenant.expert_line_user_id) {
+      await lineClient.pushMessage(tenant.expert_line_user_id, {
         type: 'text',
         text: `【エラー】AI一次チェックに失敗しました(lineUserId: ${lineUserId})。\n${err.message}`,
       }).catch(() => {});
@@ -349,6 +427,7 @@ async function getReview(reviewId) {
   const r = rows[0];
   return {
     id: r.id,
+    tenantId: r.tenant_id,
     lineUserId: r.line_user_id,
     pageCount: r.page_count,
     summary: r.summary,
@@ -483,6 +562,12 @@ app.post('/admin/review/:id/approve', async (req, res) => {
     return res.send('<p>既に送信済みです。</p>');
   }
 
+  const tenant = await getTenantById(review.tenantId);
+  if (!tenant) {
+    return res.status(500).send('<p>このレビューに紐づく会社情報が見つかりません。</p>');
+  }
+  const lineClient = clientForTenant(tenant);
+
   const pdfUrl = `${BASE_URL}/files/${review.id}.pdf`;
 
   try {
@@ -499,6 +584,46 @@ app.post('/admin/review/:id/approve', async (req, res) => {
   } catch (err) {
     console.error('❌ お客様への送信エラー:', err.message);
     res.status(500).send('<p>送信に失敗しました。時間をおいて再度お試しください。</p>');
+  }
+});
+
+// --- テナント(会社)追加用の暫定エンドポイント ---
+// 本格的なセルフサインアップ画面(item②の次のステップ)ができるまでの、
+// 成瀬さん自身が新しい会社を手動登録するための簡易手段。
+// ADMIN_SECRET環境変数が未設定の場合は、安全のためこのエンドポイント自体を無効化する。
+app.post('/admin/tenants', async (req, res) => {
+  if (!ADMIN_SECRET) {
+    return res.status(503).send('ADMIN_SECRETが未設定のため、このエンドポイントは無効化されています。');
+  }
+  if (req.headers['x-admin-secret'] !== ADMIN_SECRET) {
+    return res.status(401).send('合言葉が違います。');
+  }
+
+  const { slug, companyName, lineChannelSecret, lineChannelAccessToken, expertLineUserId, adminEmail } = req.body || {};
+  if (!slug || !companyName || !lineChannelSecret || !lineChannelAccessToken) {
+    return res.status(400).json({
+      error: 'slug, companyName, lineChannelSecret, lineChannelAccessToken は必須です。',
+    });
+  }
+
+  try {
+    const tenantId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO tenants (id, slug, company_name, admin_email, line_channel_secret, line_channel_access_token, expert_line_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [tenantId, slug, companyName, adminEmail || null, lineChannelSecret, lineChannelAccessToken, expertLineUserId || null]
+    );
+    res.json({
+      id: tenantId,
+      slug,
+      webhookUrl: `${BASE_URL}/line/webhook/${slug}`,
+    });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: `slug "${slug}" は既に使われています。` });
+    }
+    console.error('❌ テナント作成エラー:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
