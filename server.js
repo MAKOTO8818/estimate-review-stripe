@@ -437,10 +437,11 @@ async function startEstimateReview({ tenant, lineUserId, pageCount }) {
     // 学習機能の元データを蓄積(失敗しても添削フローは止めない)
     await saveLineItemsForLearning(tenant.id, reviewId, pages);
 
-    // セルフサインアップしたテナント(会社)であれば、従量課金(1ページあたり)を計上する
+    // セルフサインアップしたテナント(会社)であれば、従量課金(1ページあたり100円)を
+    // その場で登録済みカードに即時決済する(未回収リスクを避けるため、月末まとめ請求にはしない)。
     // (成瀬さん自身のデフォルトテナントはSaaS契約の対象外なので課金しない)
-    // まず自社DBに記録してからStripeへ送信するので、Stripe側への送信が一時的に失敗しても
-    // 使用量そのものは失われず、後から自動的に再送される(stripeCheckout.js参照)。
+    // まず自社DBに記録してから決済を試みるので、決済が一時的に失敗しても
+    // 使用量そのものは失われず、後から自動的に再試行される(stripeCheckout.js参照)。
     await recordAndReportTenantUsage(tenant, reviewId, pageCount);
 
     if (tenant.expert_line_user_id) {
@@ -667,7 +668,8 @@ function signupFormPage({ error, values } = {}) {
     <body style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; line-height: 1.6;">
       <h2>AI見積り添削 新規お申し込み</h2>
       <p style="color:#444;">
-        月額基本料金 5,000円 + 従量課金(見積り添削1ページあたり100円)のサブスクリプションです。<br>
+        月額基本料金 5,000円のサブスクリプションです。<br>
+        これとは別に、見積り添削を1件ご利用いただくたびに、ページ数 × 100円を登録済みのカードへ都度ご請求します。<br>
         お申し込み後、決済情報の登録画面に進みます。
       </p>
       ${error ? `<p style="color:#c00; background:#fde8e8; padding:12px; border-radius:8px;">${esc(error)}</p>` : ''}
@@ -1033,16 +1035,15 @@ app.get('/admin/tenants', async (req, res) => {
   const rowsHtml = rows
     .map((t) => {
       const usage = Number(t.month_usage);
-      const estimate =
-        t.subscription_status === 'active' ? TENANT_BASE_MONTHLY_FEE_YEN + usage * TENANT_USAGE_YEN_PER_PAGE : null;
+      const usageTotal = usage * TENANT_USAGE_YEN_PER_PAGE;
       const unreported = Number(t.unreported_count);
       return `
         <tr>
           <td>${escapeHtml(t.company_name)}<br><span style="color:#888; font-size:0.85em;">${escapeHtml(t.slug)}</span></td>
           <td>${statusLabel(t.subscription_status)}${t.is_active ? '' : '<br><span style="color:#c00;">(非アクティブ)</span>'}</td>
           <td>${usage}ページ</td>
-          <td>${estimate !== null ? `${estimate.toLocaleString()}円(概算)` : '-'}</td>
-          <td>${unreported > 0 ? `<span style="color:#c00;">${unreported}件 未送信</span>` : '-'}</td>
+          <td>${usageTotal.toLocaleString()}円(都度決済済み分の合計)<br><span style="color:#888; font-size:0.85em;">+ 月額基本料金 ${TENANT_BASE_MONTHLY_FEE_YEN.toLocaleString()}円</span></td>
+          <td>${unreported > 0 ? `<span style="color:#c00;">${unreported}件 決済失敗(自動再試行中)</span>` : '-'}</td>
         </tr>`;
     })
     .join('');
@@ -1057,16 +1058,18 @@ app.get('/admin/tenants', async (req, res) => {
     </head>
     <body style="font-family: sans-serif; padding: 20px; max-width: 900px; margin: auto; line-height: 1.6;">
       <p><a href="/admin?${secretQs}">← 管理画面トップへ戻る</a></p>
-      <h2>テナント請求状況(今月分・概算)</h2>
+      <h2>テナント請求状況(今月分)</h2>
       <p style="color:#666; font-size:0.9em;">
-        「概算請求額」は月額基本料金(${TENANT_BASE_MONTHLY_FEE_YEN.toLocaleString()}円) + 今月の使用ページ数 × ${TENANT_USAGE_YEN_PER_PAGE}円 で計算した目安です。
-        実際の請求額・請求日はStripe側の管理画面でご確認ください。「未送信」が表示されている場合は、
-        一時的にStripeへの報告が失敗した分です(自動的に再送されるため、通常は時間が経てば消えます)。
+        従量課金(1ページ${TENANT_USAGE_YEN_PER_PAGE}円)は、見積り添削のたびに登録済みカードへ即時決済される方式です。
+        「都度決済済み分の合計」は、今月すでに決済が成功した分の合計金額です。これとは別に、
+        月額基本料金(${TENANT_BASE_MONTHLY_FEE_YEN.toLocaleString()}円)がStripe側のサブスクリプションとして毎月自動請求されます。
+        「決済失敗」が表示されている場合は、カードの有効期限切れ等で即時決済に失敗した分です
+        (自動的に再試行されますが、改善しない場合はテナント側にカード情報の更新を依頼してください)。
       </p>
       <table style="width:100%; border-collapse: collapse;" cellpadding="10">
         <thead>
           <tr style="border-bottom: 2px solid #333; text-align:left;">
-            <th>会社名</th><th>契約状況</th><th>今月の使用量</th><th>概算請求額</th><th>送信状況</th>
+            <th>会社名</th><th>契約状況</th><th>今月の使用量</th><th>今月の請求状況</th><th>決済状況</th>
           </tr>
         </thead>
         <tbody>
