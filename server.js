@@ -41,7 +41,10 @@ const {
   createEstimateReviewCheckoutSession,
   createTenantSubscriptionCheckoutSession,
   finalizeTenantSubscriptionFromSession,
-  reportTenantUsage,
+  recordAndReportTenantUsage,
+  retryUnreportedTenantUsage,
+  TENANT_BASE_MONTHLY_FEE_YEN,
+  TENANT_USAGE_YEN_PER_PAGE,
   stripe,
 } = require('./stripeCheckout');
 const { reviewEstimate } = require('./aiReview');
@@ -419,9 +422,9 @@ async function startEstimateReview({ tenant, lineUserId, pageCount }) {
 
     // セルフサインアップしたテナント(会社)であれば、従量課金(1ページあたり)を計上する
     // (成瀬さん自身のデフォルトテナントはSaaS契約の対象外なので課金しない)
-    if (tenant.slug !== 'default') {
-      await reportTenantUsage(tenant, pageCount);
-    }
+    // まず自社DBに記録してからStripeへ送信するので、Stripe側への送信が一時的に失敗しても
+    // 使用量そのものは失われず、後から自動的に再送される(stripeCheckout.js参照)。
+    await recordAndReportTenantUsage(tenant, reviewId, pageCount);
 
     if (tenant.expert_line_user_id) {
       await lineClient.pushMessage(tenant.expert_line_user_id, {
@@ -787,6 +790,78 @@ app.get('/signup/complete', async (req, res) => {
   }
 });
 
+// --- 月末請求の確認画面(成瀬さん用。各テナントの今月の使用量・概算請求額を一覧表示する) ---
+app.get('/admin/tenants', async (req, res) => {
+  if (!ADMIN_SECRET) {
+    return res.status(503).send('ADMIN_SECRETが未設定のため、このページは無効化されています。');
+  }
+  if (req.query.secret !== ADMIN_SECRET) {
+    return res
+      .status(401)
+      .send('<p>合言葉が違います。URLの末尾に <code>?secret=(ADMIN_SECRETの値)</code> を付けてアクセスしてください。</p>');
+  }
+
+  const { rows } = await pool.query(`
+    SELECT
+      t.id, t.slug, t.company_name, t.admin_email, t.is_active, t.subscription_status, t.stripe_customer_id,
+      COALESCE(SUM(u.quantity) FILTER (WHERE u.created_at >= date_trunc('month', now())), 0) AS month_usage,
+      COUNT(u.id) FILTER (WHERE u.reported_to_stripe = false) AS unreported_count
+    FROM tenants t
+    LEFT JOIN tenant_usage_events u ON u.tenant_id = t.id
+    WHERE t.slug != 'default'
+    GROUP BY t.id
+    ORDER BY t.created_at DESC
+  `);
+
+  const statusLabel = (s) => ({ active: '契約中', pending: '決済待ち', canceled: '解約済み' }[s] || s);
+
+  const rowsHtml = rows
+    .map((t) => {
+      const usage = Number(t.month_usage);
+      const estimate =
+        t.subscription_status === 'active' ? TENANT_BASE_MONTHLY_FEE_YEN + usage * TENANT_USAGE_YEN_PER_PAGE : null;
+      const unreported = Number(t.unreported_count);
+      return `
+        <tr>
+          <td>${escapeHtml(t.company_name)}<br><span style="color:#888; font-size:0.85em;">${escapeHtml(t.slug)}</span></td>
+          <td>${statusLabel(t.subscription_status)}${t.is_active ? '' : '<br><span style="color:#c00;">(非アクティブ)</span>'}</td>
+          <td>${usage}ページ</td>
+          <td>${estimate !== null ? `${estimate.toLocaleString()}円(概算)` : '-'}</td>
+          <td>${unreported > 0 ? `<span style="color:#c00;">${unreported}件 未送信</span>` : '-'}</td>
+        </tr>`;
+    })
+    .join('');
+
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>テナント請求状況</title>
+    </head>
+    <body style="font-family: sans-serif; padding: 20px; max-width: 900px; margin: auto; line-height: 1.6;">
+      <h2>テナント請求状況(今月分・概算)</h2>
+      <p style="color:#666; font-size:0.9em;">
+        「概算請求額」は月額基本料金(${TENANT_BASE_MONTHLY_FEE_YEN.toLocaleString()}円) + 今月の使用ページ数 × ${TENANT_USAGE_YEN_PER_PAGE}円 で計算した目安です。
+        実際の請求額・請求日はStripe側の管理画面でご確認ください。「未送信」が表示されている場合は、
+        一時的にStripeへの報告が失敗した分です(自動的に再送されるため、通常は時間が経てば消えます)。
+      </p>
+      <table style="width:100%; border-collapse: collapse;" cellpadding="10">
+        <thead>
+          <tr style="border-bottom: 2px solid #333; text-align:left;">
+            <th>会社名</th><th>契約状況</th><th>今月の使用量</th><th>概算請求額</th><th>送信状況</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rowsHtml || '<tr><td colspan="5">テナントがまだありません。</td></tr>'}
+        </tbody>
+      </table>
+    </body>
+    </html>
+  `);
+});
+
 // --- テナント(会社)追加用の暫定エンドポイント ---
 // 本格的なセルフサインアップ画面(item②の次のステップ)ができるまでの、
 // 成瀬さん自身が新しい会社を手動登録するための簡易手段。
@@ -832,6 +907,12 @@ initDb()
     app.listen(PORT, () => {
       console.log(`Server running on http://localhost:${PORT}`);
     });
+
+    // Stripeへの使用量送信に失敗して溜まっている分を、起動時と10分おきに自動で再送する
+    retryUnreportedTenantUsage().catch((err) => console.error('❌ 使用量の再送処理でエラー:', err));
+    setInterval(() => {
+      retryUnreportedTenantUsage().catch((err) => console.error('❌ 使用量の再送処理でエラー:', err));
+    }, 10 * 60 * 1000);
   })
   .catch((err) => {
     console.error('❌ DB初期化に失敗したため、サーバーを起動できません:', err);
