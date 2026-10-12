@@ -27,6 +27,14 @@
  *   (今のところ、決済そのものはすべて同じStripeアカウントで受け付ける。
  *    会社ごとに別々のStripeアカウントで受け付ける仕組み(Stripe Connect)は、
  *    従量課金の自動化(item③)に合わせて別途検討する)
+ *
+ * テナント(会社)向けのサブスクリプション課金について(2026-10-12 決定事項):
+ *   セルフサインアップで登録した会社には、以下を毎月課金する:
+ *     - 月額基本料金: 5,000円/月
+ *     - 従量課金: 見積り添削1ページあたり100円(Stripeの Billing Meters を使用)
+ *   月額基本料金・従量課金ともに、全テナント共通の Price を1つだけ作成し、
+ *   (初回だけStripe側に作成、以降はDBのbilling_configテーブルに保存したIDを再利用する)
+ *   テナントごとに別々のStripe Customer・Subscriptionを作ってそのPriceに紐づける。
  */
 
 const Stripe = require('stripe');
@@ -158,4 +166,171 @@ async function createEstimateReviewCheckoutSession({
   return { id: session.id, url: session.url };
 }
 
-module.exports = { createEstimateReviewCheckoutSession, findOrCreateCustomerForLineUser, stripe };
+// --- テナント(会社)向けサブスクリプション課金 ---
+
+const TENANT_BASE_MONTHLY_FEE_YEN = 5000; // 月額基本料金
+const TENANT_USAGE_YEN_PER_PAGE = 100; // 従量課金(見積り添削1ページあたり)
+const TENANT_METER_EVENT_NAME = 'tenant_estimate_review_page';
+
+async function getBillingConfigValue(key) {
+  const { rows } = await pool.query('SELECT value FROM billing_config WHERE key = $1', [key]);
+  return rows.length > 0 ? rows[0].value : null;
+}
+
+async function setBillingConfigValue(key, value) {
+  await pool.query(
+    `INSERT INTO billing_config (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [key, value]
+  );
+}
+
+// 同一プロセス内では毎回Stripe/DBに問い合わせなくて済むようにキャッシュする
+let billingConfigCache = null;
+
+/**
+ * テナント課金用の Meter / Price が無ければ作成し、あれば再利用する。
+ * (初回起動時にだけStripe側への作成が走り、以降はDBに保存されたIDを使う)
+ * @returns {Promise<{ meterId: string, basePriceId: string, usagePriceId: string }>}
+ */
+async function ensureTenantBillingConfig() {
+  if (billingConfigCache) return billingConfigCache;
+
+  let meterId = await getBillingConfigValue('meter_id');
+  if (!meterId) {
+    const meter = await stripe.billing.meters.create({
+      display_name: 'AI見積り添削 テナント従量課金(1ページあたり)',
+      event_name: TENANT_METER_EVENT_NAME,
+      default_aggregation: { formula: 'sum' },
+      customer_mapping: { type: 'by_id', event_payload_key: 'stripe_customer_id' },
+      value_settings: { event_payload_key: 'value' },
+    });
+    meterId = meter.id;
+    await setBillingConfigValue('meter_id', meterId);
+    console.log('✅ Stripe Meterを作成しました:', meterId);
+  }
+
+  let basePriceId = await getBillingConfigValue('base_price_id');
+  if (!basePriceId) {
+    const price = await stripe.prices.create({
+      currency: 'jpy',
+      unit_amount: TENANT_BASE_MONTHLY_FEE_YEN,
+      recurring: { interval: 'month' },
+      product_data: { name: 'AI見積り添削 月額基本料金' },
+    });
+    basePriceId = price.id;
+    await setBillingConfigValue('base_price_id', basePriceId);
+    console.log('✅ 月額基本料金のPriceを作成しました:', basePriceId);
+  }
+
+  let usagePriceId = await getBillingConfigValue('usage_price_id');
+  if (!usagePriceId) {
+    const price = await stripe.prices.create({
+      currency: 'jpy',
+      unit_amount: TENANT_USAGE_YEN_PER_PAGE,
+      billing_scheme: 'per_unit',
+      recurring: { interval: 'month', usage_type: 'metered', meter: meterId },
+      product_data: { name: 'AI見積り添削 従量課金(1ページあたり)' },
+    });
+    usagePriceId = price.id;
+    await setBillingConfigValue('usage_price_id', usagePriceId);
+    console.log('✅ 従量課金のPriceを作成しました:', usagePriceId);
+  }
+
+  billingConfigCache = { meterId, basePriceId, usagePriceId };
+  return billingConfigCache;
+}
+
+/**
+ * セルフサインアップしたテナント(会社)用に、サブスクリプション契約のための
+ * Checkout Session(mode: 'subscription')を作成する。
+ * @param {object} params
+ * @param {string} params.tenantId
+ * @param {string} params.companyName
+ * @param {string} [params.adminEmail]
+ * @param {string} params.successUrl
+ * @param {string} params.cancelUrl
+ * @returns {Promise<{ id: string, url: string }>}
+ */
+async function createTenantSubscriptionCheckoutSession({ tenantId, companyName, adminEmail, successUrl, cancelUrl }) {
+  const { basePriceId, usagePriceId } = await ensureTenantBillingConfig();
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'subscription',
+    customer_email: adminEmail || undefined,
+    line_items: [
+      { price: basePriceId, quantity: 1 },
+      { price: usagePriceId },
+    ],
+    metadata: { tenant_id: tenantId, purpose: 'tenant_subscription' },
+    subscription_data: {
+      metadata: { tenant_id: tenantId, purpose: 'tenant_subscription' },
+    },
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+  });
+
+  return { id: session.id, url: session.url };
+}
+
+/**
+ * テナントの契約状況をStripe Checkout SessionのIDから確定させ、DBに反映する。
+ * Webhook到達前でも/signup/completeの表示時点で即時反映できるようにするための関数。
+ * (Webhookと両方から呼ばれても安全なよう、何度呼んでも同じ結果になるようにしている)
+ * @param {string} sessionId
+ * @returns {Promise<{ tenantId: string, subscriptionStatus: string } | null>}
+ */
+async function finalizeTenantSubscriptionFromSession(sessionId) {
+  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['subscription'] });
+  if (session.mode !== 'subscription' || session.metadata?.purpose !== 'tenant_subscription') {
+    return null;
+  }
+  const tenantId = session.metadata.tenant_id;
+  if (!tenantId || session.status !== 'complete') {
+    return null;
+  }
+
+  const subscription = session.subscription;
+  const subscriptionId = typeof subscription === 'string' ? subscription : subscription?.id;
+  const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
+
+  await pool.query(
+    `UPDATE tenants
+     SET is_active = true, subscription_status = 'active', stripe_customer_id = $1, stripe_subscription_id = $2
+     WHERE id = $3`,
+    [customerId, subscriptionId, tenantId]
+  );
+
+  return { tenantId, subscriptionStatus: 'active' };
+}
+
+/**
+ * テナントの今月の使用量(見積り添削のページ数)をStripeに報告する(従量課金の計上)。
+ * サブスクリプションが有効なテナントのみ報告する。失敗しても添削フロー自体は止めない。
+ * @param {object} tenant tenants テーブルの1行(stripe_customer_id, subscription_status を含む)
+ * @param {number} quantity 今回添削したページ数
+ */
+async function reportTenantUsage(tenant, quantity) {
+  if (!tenant.stripe_customer_id || tenant.subscription_status !== 'active') return;
+  try {
+    await ensureTenantBillingConfig();
+    await stripe.billing.meterEvents.create({
+      event_name: TENANT_METER_EVENT_NAME,
+      payload: {
+        stripe_customer_id: tenant.stripe_customer_id,
+        value: String(quantity),
+      },
+    });
+  } catch (err) {
+    console.error(`⚠️ [${tenant.slug}] 従量課金の使用量送信に失敗しました:`, err.message);
+  }
+}
+
+module.exports = {
+  createEstimateReviewCheckoutSession,
+  findOrCreateCustomerForLineUser,
+  createTenantSubscriptionCheckoutSession,
+  finalizeTenantSubscriptionFromSession,
+  reportTenantUsage,
+  stripe,
+};
