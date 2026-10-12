@@ -281,6 +281,56 @@ async function finalizeTenantSubscriptionFromSession(sessionId) {
 }
 
 /**
+ * テナントの登録済みカード(支払い方法)のIDを、複数の手がかりから探して返す。
+ * Stripe Checkout(サブスクリプション)で登録したカードは、必ずしも
+ * 顧客の「デフォルト支払い方法(invoice_settings.default_payment_method)」に
+ * 自動設定されるとは限らないため、以下の順で確実に探す:
+ *   1. 顧客のデフォルト支払い方法(invoice_settings.default_payment_method)
+ *   2. 顧客のデフォルトの古い形式の支払い元(default_source)
+ *   3. サブスクリプション自体に設定されているデフォルト支払い方法
+ *   4. 上記で見つからない場合、その顧客に登録されているカードを直接検索し、最新のものを使う
+ * @param {object} tenant tenants テーブルの1行(stripe_customer_id, stripe_subscription_id を含む)
+ * @returns {Promise<string|null>}
+ */
+async function findTenantPaymentMethodId(tenant) {
+  const customer = await stripe.customers.retrieve(tenant.stripe_customer_id);
+
+  if (customer.invoice_settings && customer.invoice_settings.default_payment_method) {
+    const pm = customer.invoice_settings.default_payment_method;
+    return typeof pm === 'string' ? pm : pm.id;
+  }
+
+  if (customer.default_source) {
+    const src = customer.default_source;
+    return typeof src === 'string' ? src : src.id;
+  }
+
+  if (tenant.stripe_subscription_id) {
+    try {
+      const subscription = await stripe.subscriptions.retrieve(tenant.stripe_subscription_id);
+      if (subscription.default_payment_method) {
+        const pm = subscription.default_payment_method;
+        return typeof pm === 'string' ? pm : pm.id;
+      }
+    } catch (err) {
+      // サブスクリプションの取得に失敗しても、次の手段(直接検索)にフォールバックする
+      console.error(`⚠️ [${tenant.slug}] サブスクリプション情報の取得に失敗しました:`, err.message);
+    }
+  }
+
+  const methods = await stripe.paymentMethods.list({
+    customer: tenant.stripe_customer_id,
+    type: 'card',
+    limit: 1,
+  });
+  if (methods.data.length > 0) {
+    return methods.data[0].id;
+  }
+
+  return null;
+}
+
+/**
  * テナントの登録済みカード(サブスクリプション契約時に保存されたもの)に対して、
  * 従量課金分(ページ数 × 100円)をその場で即時決済する(1件分)。
  * 成功したらDB側に決済済みの印をつける。
@@ -294,11 +344,7 @@ async function chargeTenantUsageImmediately(tenant, usageEventId, reviewId, quan
   if (amount <= 0) return;
 
   try {
-    const customer = await stripe.customers.retrieve(tenant.stripe_customer_id);
-    const paymentMethodId =
-      (customer.invoice_settings && customer.invoice_settings.default_payment_method) ||
-      customer.default_source ||
-      null;
+    const paymentMethodId = await findTenantPaymentMethodId(tenant);
 
     if (!paymentMethodId) {
       throw new Error('登録済みの支払い方法が見つかりません(カード登録が完了していない可能性があります)');
@@ -374,7 +420,7 @@ async function recordAndReportTenantUsage(tenant, reviewId, quantity) {
 async function retryUnreportedTenantUsage() {
   const { rows } = await pool.query(
     `SELECT u.id AS usage_id, u.review_id, u.quantity,
-            t.id AS tenant_id, t.slug, t.stripe_customer_id, t.subscription_status
+            t.id AS tenant_id, t.slug, t.stripe_customer_id, t.stripe_subscription_id, t.subscription_status
      FROM tenant_usage_events u
      JOIN tenants t ON t.id = u.tenant_id
      WHERE u.reported_to_stripe = false
@@ -386,6 +432,7 @@ async function retryUnreportedTenantUsage() {
       id: row.tenant_id,
       slug: row.slug,
       stripe_customer_id: row.stripe_customer_id,
+      stripe_subscription_id: row.stripe_subscription_id,
       subscription_status: row.subscription_status,
     };
     await chargeTenantUsageImmediately(tenant, row.usage_id, row.review_id, row.quantity);
