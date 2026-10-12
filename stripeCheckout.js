@@ -306,24 +306,92 @@ async function finalizeTenantSubscriptionFromSession(sessionId) {
 }
 
 /**
- * テナントの今月の使用量(見積り添削のページ数)をStripeに報告する(従量課金の計上)。
- * サブスクリプションが有効なテナントのみ報告する。失敗しても添削フロー自体は止めない。
- * @param {object} tenant tenants テーブルの1行(stripe_customer_id, subscription_status を含む)
- * @param {number} quantity 今回添削したページ数
+ * Stripeに実際にMeter Eventを送信する(1件分)。成功したらDB側に送信済みの印をつける。
+ * 失敗しても例外を投げない(呼び出し側の添削フローを止めないため)。
+ * idempotencyKeyにreview_idを使うことで、同じレビューを誤って二重送信しても
+ * Stripe側で重複計上されないようにしている。
  */
-async function reportTenantUsage(tenant, quantity) {
+async function sendUsageEventToStripe(tenant, usageEventId, reviewId, quantity) {
   if (!tenant.stripe_customer_id || tenant.subscription_status !== 'active') return;
   try {
     await ensureTenantBillingConfig();
-    await stripe.billing.meterEvents.create({
-      event_name: TENANT_METER_EVENT_NAME,
-      payload: {
-        stripe_customer_id: tenant.stripe_customer_id,
-        value: String(quantity),
+    await stripe.billing.meterEvents.create(
+      {
+        event_name: TENANT_METER_EVENT_NAME,
+        payload: {
+          stripe_customer_id: tenant.stripe_customer_id,
+          value: String(quantity),
+        },
       },
-    });
+      { idempotencyKey: `tenant-usage-${reviewId}` }
+    );
+    await pool.query(
+      `UPDATE tenant_usage_events SET reported_to_stripe = true, reported_at = now() WHERE id = $1`,
+      [usageEventId]
+    );
   } catch (err) {
-    console.error(`⚠️ [${tenant.slug}] 従量課金の使用量送信に失敗しました:`, err.message);
+    console.error(
+      `⚠️ [${tenant.slug}] 従量課金の使用量送信に失敗しました(DBには記録済みのため、後ほど自動的に再送されます):`,
+      err.message
+    );
+  }
+}
+
+/**
+ * テナントの使用量(見積り添削1件分のページ数)を記録・報告する。
+ * 1. まず自社DB(tenant_usage_events)に記録する(review_idにユニーク制約があるため、
+ *    同じレビューに対して二重に呼び出されても二重計上されない)。
+ * 2. 続けてStripeへの報告を試みる。失敗しても、DBには記録が残っているので
+ *    retryUnreportedTenantUsage() による自動再送の対象になる(使用量そのものを失わない)。
+ * @param {object} tenant tenants テーブルの1行
+ * @param {string} reviewId pending_reviews.id
+ * @param {number} quantity 今回添削したページ数
+ */
+async function recordAndReportTenantUsage(tenant, reviewId, quantity) {
+  if (tenant.slug === 'default') return; // 成瀬さん自身の事業はSaaS課金の対象外
+
+  let usageEventId;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO tenant_usage_events (tenant_id, review_id, quantity)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (review_id) DO NOTHING
+       RETURNING id`,
+      [tenant.id, reviewId, quantity]
+    );
+    if (rows.length === 0) return; // 既に記録済み(二重呼び出し)。何もしない。
+    usageEventId = rows[0].id;
+  } catch (err) {
+    console.error(`⚠️ [${tenant.slug}] 使用量のDB記録に失敗しました:`, err.message);
+    return;
+  }
+
+  await sendUsageEventToStripe(tenant, usageEventId, reviewId, quantity);
+}
+
+/**
+ * Stripeへの送信に失敗してDBに溜まっている使用量を再送する。
+ * サーバー起動時、および一定時間おきに自動実行される(server.js参照)。
+ * 1回につき最大50件まで(溜まりすぎている場合は次回に持ち越す)。
+ */
+async function retryUnreportedTenantUsage() {
+  const { rows } = await pool.query(
+    `SELECT u.id AS usage_id, u.review_id, u.quantity,
+            t.id AS tenant_id, t.slug, t.stripe_customer_id, t.subscription_status
+     FROM tenant_usage_events u
+     JOIN tenants t ON t.id = u.tenant_id
+     WHERE u.reported_to_stripe = false
+     ORDER BY u.created_at ASC
+     LIMIT 50`
+  );
+  for (const row of rows) {
+    const tenant = {
+      id: row.tenant_id,
+      slug: row.slug,
+      stripe_customer_id: row.stripe_customer_id,
+      subscription_status: row.subscription_status,
+    };
+    await sendUsageEventToStripe(tenant, row.usage_id, row.review_id, row.quantity);
   }
 }
 
@@ -332,6 +400,9 @@ module.exports = {
   findOrCreateCustomerForLineUser,
   createTenantSubscriptionCheckoutSession,
   finalizeTenantSubscriptionFromSession,
-  reportTenantUsage,
+  recordAndReportTenantUsage,
+  retryUnreportedTenantUsage,
+  TENANT_BASE_MONTHLY_FEE_YEN,
+  TENANT_USAGE_YEN_PER_PAGE,
   stripe,
 };
