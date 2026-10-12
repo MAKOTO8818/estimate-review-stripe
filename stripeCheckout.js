@@ -28,11 +28,14 @@
  *    会社ごとに別々のStripeアカウントで受け付ける仕組み(Stripe Connect)は、
  *    従量課金の自動化(item③)に合わせて別途検討する)
  *
- * テナント(会社)向けのサブスクリプション課金について(2026-10-12 決定事項):
- *   セルフサインアップで登録した会社には、以下を毎月課金する:
- *     - 月額基本料金: 5,000円/月
- *     - 従量課金: 見積り添削1ページあたり100円(Stripeの Billing Meters を使用)
- *   月額基本料金・従量課金ともに、全テナント共通の Price を1つだけ作成し、
+ * テナント(会社)向けの課金について(2026-10-13 更新):
+ *   セルフサインアップで登録した会社には、以下を課金する:
+ *     - 月額基本料金: 5,000円/月(Stripeのサブスクリプションとして毎月自動請求)
+ *     - 従量課金: 見積り添削1件ごとに、ページ数 × 100円を、その場で即時決済する
+ *       (月末まで溜めて請求するのではなく、サインアップ時に登録したカードに対して
+ *        都度 PaymentIntent で即時課金することで、未回収リスクを避ける。
+ *        2026-10-13 成瀬さんの指示により、Stripe Billing Meters での月末まとめ請求から変更した)
+ *   月額基本料金は、全テナント共通の Price を1つだけ作成し、
  *   (初回だけStripe側に作成、以降はDBのbilling_configテーブルに保存したIDを再利用する)
  *   テナントごとに別々のStripe Customer・Subscriptionを作ってそのPriceに紐づける。
  */
@@ -169,8 +172,7 @@ async function createEstimateReviewCheckoutSession({
 // --- テナント(会社)向けサブスクリプション課金 ---
 
 const TENANT_BASE_MONTHLY_FEE_YEN = 5000; // 月額基本料金
-const TENANT_USAGE_YEN_PER_PAGE = 100; // 従量課金(見積り添削1ページあたり)
-const TENANT_METER_EVENT_NAME = 'tenant_estimate_review_page';
+const TENANT_USAGE_YEN_PER_PAGE = 100; // 従量課金(見積り添削1ページあたり。都度即時決済する)
 
 async function getBillingConfigValue(key) {
   const { rows } = await pool.query('SELECT value FROM billing_config WHERE key = $1', [key]);
@@ -189,26 +191,14 @@ async function setBillingConfigValue(key, value) {
 let billingConfigCache = null;
 
 /**
- * テナント課金用の Meter / Price が無ければ作成し、あれば再利用する。
+ * テナント課金用の月額基本料金 Price が無ければ作成し、あれば再利用する。
  * (初回起動時にだけStripe側への作成が走り、以降はDBに保存されたIDを使う)
- * @returns {Promise<{ meterId: string, basePriceId: string, usagePriceId: string }>}
+ * 従量課金(1ページ100円)は、サブスクリプションのPriceとしては作らず、
+ * 見積り添削のたびに chargeTenantUsageImmediately() で都度PaymentIntentとして即時決済する。
+ * @returns {Promise<{ basePriceId: string }>}
  */
 async function ensureTenantBillingConfig() {
   if (billingConfigCache) return billingConfigCache;
-
-  let meterId = await getBillingConfigValue('meter_id');
-  if (!meterId) {
-    const meter = await stripe.billing.meters.create({
-      display_name: 'AI見積り添削 テナント従量課金(1ページあたり)',
-      event_name: TENANT_METER_EVENT_NAME,
-      default_aggregation: { formula: 'sum' },
-      customer_mapping: { type: 'by_id', event_payload_key: 'stripe_customer_id' },
-      value_settings: { event_payload_key: 'value' },
-    });
-    meterId = meter.id;
-    await setBillingConfigValue('meter_id', meterId);
-    console.log('✅ Stripe Meterを作成しました:', meterId);
-  }
 
   let basePriceId = await getBillingConfigValue('base_price_id');
   if (!basePriceId) {
@@ -223,21 +213,7 @@ async function ensureTenantBillingConfig() {
     console.log('✅ 月額基本料金のPriceを作成しました:', basePriceId);
   }
 
-  let usagePriceId = await getBillingConfigValue('usage_price_id');
-  if (!usagePriceId) {
-    const price = await stripe.prices.create({
-      currency: 'jpy',
-      unit_amount: TENANT_USAGE_YEN_PER_PAGE,
-      billing_scheme: 'per_unit',
-      recurring: { interval: 'month', usage_type: 'metered', meter: meterId },
-      product_data: { name: 'AI見積り添削 従量課金(1ページあたり)' },
-    });
-    usagePriceId = price.id;
-    await setBillingConfigValue('usage_price_id', usagePriceId);
-    console.log('✅ 従量課金のPriceを作成しました:', usagePriceId);
-  }
-
-  billingConfigCache = { meterId, basePriceId, usagePriceId };
+  billingConfigCache = { basePriceId };
   return billingConfigCache;
 }
 
@@ -253,7 +229,7 @@ async function ensureTenantBillingConfig() {
  * @returns {Promise<{ id: string, url: string }>}
  */
 async function createTenantSubscriptionCheckoutSession({ tenantId, companyName, adminEmail, successUrl, cancelUrl }) {
-  const { basePriceId, usagePriceId } = await ensureTenantBillingConfig();
+  const { basePriceId } = await ensureTenantBillingConfig();
 
   const session = await stripe.checkout.sessions.create({
     mode: 'subscription',
@@ -261,7 +237,6 @@ async function createTenantSubscriptionCheckoutSession({ tenantId, companyName, 
     customer_email: adminEmail || undefined,
     line_items: [
       { price: basePriceId, quantity: 1 },
-      { price: usagePriceId },
     ],
     metadata: { tenant_id: tenantId, purpose: 'tenant_subscription' },
     subscription_data: {
@@ -306,43 +281,65 @@ async function finalizeTenantSubscriptionFromSession(sessionId) {
 }
 
 /**
- * Stripeに実際にMeter Eventを送信する(1件分)。成功したらDB側に送信済みの印をつける。
+ * テナントの登録済みカード(サブスクリプション契約時に保存されたもの)に対して、
+ * 従量課金分(ページ数 × 100円)をその場で即時決済する(1件分)。
+ * 成功したらDB側に決済済みの印をつける。
  * 失敗しても例外を投げない(呼び出し側の添削フローを止めないため)。
- * idempotencyKeyにreview_idを使うことで、同じレビューを誤って二重送信しても
- * Stripe側で重複計上されないようにしている。
+ * idempotencyKeyにreview_idを使うことで、同じレビューを誤って二重に呼び出しても
+ * 二重決済にならないようにしている。
  */
-async function sendUsageEventToStripe(tenant, usageEventId, reviewId, quantity) {
+async function chargeTenantUsageImmediately(tenant, usageEventId, reviewId, quantity) {
   if (!tenant.stripe_customer_id || tenant.subscription_status !== 'active') return;
+  const amount = quantity * TENANT_USAGE_YEN_PER_PAGE;
+  if (amount <= 0) return;
+
   try {
-    await ensureTenantBillingConfig();
-    await stripe.billing.meterEvents.create(
+    const customer = await stripe.customers.retrieve(tenant.stripe_customer_id);
+    const paymentMethodId =
+      (customer.invoice_settings && customer.invoice_settings.default_payment_method) ||
+      customer.default_source ||
+      null;
+
+    if (!paymentMethodId) {
+      throw new Error('登録済みの支払い方法が見つかりません(カード登録が完了していない可能性があります)');
+    }
+
+    await stripe.paymentIntents.create(
       {
-        event_name: TENANT_METER_EVENT_NAME,
-        payload: {
-          stripe_customer_id: tenant.stripe_customer_id,
-          value: String(quantity),
+        amount,
+        currency: 'jpy',
+        customer: tenant.stripe_customer_id,
+        payment_method: paymentMethodId,
+        off_session: true,
+        confirm: true,
+        description: `AI見積り添削 従量課金(${quantity}ページ分)`,
+        metadata: {
+          tenant_id: tenant.id,
+          review_id: reviewId,
+          purpose: 'tenant_usage_charge',
         },
       },
-      { idempotencyKey: `tenant-usage-${reviewId}` }
+      { idempotencyKey: `tenant-usage-charge-${reviewId}` }
     );
+
     await pool.query(
       `UPDATE tenant_usage_events SET reported_to_stripe = true, reported_at = now() WHERE id = $1`,
       [usageEventId]
     );
   } catch (err) {
     console.error(
-      `⚠️ [${tenant.slug}] 従量課金の使用量送信に失敗しました(DBには記録済みのため、後ほど自動的に再送されます):`,
+      `⚠️ [${tenant.slug}] 従量課金の即時決済に失敗しました(DBには記録済みのため、後ほど自動的に再試行されます):`,
       err.message
     );
   }
 }
 
 /**
- * テナントの使用量(見積り添削1件分のページ数)を記録・報告する。
+ * テナントの使用量(見積り添削1件分のページ数)を記録し、その場で即時決済する。
  * 1. まず自社DB(tenant_usage_events)に記録する(review_idにユニーク制約があるため、
  *    同じレビューに対して二重に呼び出されても二重計上されない)。
- * 2. 続けてStripeへの報告を試みる。失敗しても、DBには記録が残っているので
- *    retryUnreportedTenantUsage() による自動再送の対象になる(使用量そのものを失わない)。
+ * 2. 続けてStripeへの即時決済(PaymentIntent)を試みる。失敗しても、DBには記録が残っているので
+ *    retryUnreportedTenantUsage() による自動再試行の対象になる(使用量そのものを失わない)。
  * @param {object} tenant tenants テーブルの1行
  * @param {string} reviewId pending_reviews.id
  * @param {number} quantity 今回添削したページ数
@@ -366,11 +363,11 @@ async function recordAndReportTenantUsage(tenant, reviewId, quantity) {
     return;
   }
 
-  await sendUsageEventToStripe(tenant, usageEventId, reviewId, quantity);
+  await chargeTenantUsageImmediately(tenant, usageEventId, reviewId, quantity);
 }
 
 /**
- * Stripeへの送信に失敗してDBに溜まっている使用量を再送する。
+ * 即時決済に失敗してDBに溜まっている使用量を再試行する。
  * サーバー起動時、および一定時間おきに自動実行される(server.js参照)。
  * 1回につき最大50件まで(溜まりすぎている場合は次回に持ち越す)。
  */
@@ -391,7 +388,7 @@ async function retryUnreportedTenantUsage() {
       stripe_customer_id: row.stripe_customer_id,
       subscription_status: row.subscription_status,
     };
-    await sendUsageEventToStripe(tenant, row.usage_id, row.review_id, row.quantity);
+    await chargeTenantUsageImmediately(tenant, row.usage_id, row.review_id, row.quantity);
   }
 }
 
