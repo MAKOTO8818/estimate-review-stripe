@@ -912,9 +912,55 @@ app.get('/admin/tenants/:id/edit', async (req, res) => {
           保存する
         </button>
       </form>
+      ${
+        tenant.slug === 'default'
+          ? ''
+          : `
+      <hr style="margin: 30px 0; border:none; border-top:1px solid #ddd;">
+      <form method="POST" action="/admin/tenants/${tenant.id}/delete?${secretQs}"
+            onsubmit="return confirm('本当に削除しますか？このテナントのデータは元に戻せません。');">
+        <button type="submit" style="font-size:14px; padding:10px 16px; background:#c00; color:white; border:none; border-radius:8px;">
+          このテナントを削除する
+        </button>
+      </form>`
+      }
     </body>
     </html>
   `);
+});
+
+app.post('/admin/tenants/:id/delete', async (req, res) => {
+  if (!requireAdminSecret(req, res)) return;
+  const secretQs = `secret=${encodeURIComponent(req.query.secret)}`;
+
+  const tenant = await getTenantById(req.params.id);
+  if (!tenant) {
+    return res.status(404).send('<p>このテナントは見つかりません。</p>');
+  }
+  if (tenant.slug === 'default') {
+    return res.status(400).send('<p>デフォルトテナント(成瀬さんの本業)は削除できません。</p>');
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM tenant_usage_events WHERE tenant_id = $1', [tenant.id]);
+    await client.query('DELETE FROM seen_users WHERE tenant_id = $1', [tenant.id]);
+    await client.query('DELETE FROM stripe_customers WHERE tenant_id = $1', [tenant.id]);
+    await client.query('DELETE FROM pending_estimate_pdfs WHERE tenant_id = $1', [tenant.id]);
+    await client.query('DELETE FROM estimate_line_items WHERE tenant_id = $1', [tenant.id]);
+    await client.query('DELETE FROM pending_reviews WHERE tenant_id = $1', [tenant.id]);
+    await client.query('DELETE FROM tenants WHERE id = $1', [tenant.id]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('❌ テナント削除エラー:', err);
+    return res.status(500).send(`<p>削除に失敗しました: ${escapeHtml(err.message)}</p>`);
+  } finally {
+    client.release();
+  }
+
+  res.redirect(`/admin?${secretQs}`);
 });
 
 app.post('/admin/tenants/:id/edit', async (req, res) => {
