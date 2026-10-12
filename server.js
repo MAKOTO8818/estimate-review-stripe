@@ -790,16 +790,168 @@ app.get('/signup/complete', async (req, res) => {
   }
 });
 
-// --- 月末請求の確認画面(成瀬さん用。各テナントの今月の使用量・概算請求額を一覧表示する) ---
-app.get('/admin/tenants', async (req, res) => {
+// --- 管理画面トップ(成瀬さん用。全テナント一覧。編集・請求状況へのリンクを持つ) ---
+function requireAdminSecret(req, res) {
   if (!ADMIN_SECRET) {
-    return res.status(503).send('ADMIN_SECRETが未設定のため、このページは無効化されています。');
+    res.status(503).send('ADMIN_SECRETが未設定のため、このページは無効化されています。');
+    return false;
   }
   if (req.query.secret !== ADMIN_SECRET) {
-    return res
+    res
       .status(401)
       .send('<p>合言葉が違います。URLの末尾に <code>?secret=(ADMIN_SECRETの値)</code> を付けてアクセスしてください。</p>');
+    return false;
   }
+  return true;
+}
+
+app.get('/admin', async (req, res) => {
+  if (!requireAdminSecret(req, res)) return;
+  const secretQs = `secret=${encodeURIComponent(req.query.secret)}`;
+
+  const { rows } = await pool.query(`SELECT * FROM tenants ORDER BY created_at ASC`);
+
+  const statusLabel = (s) => ({ active: '契約中', pending: '決済待ち', canceled: '解約済み' }[s] || s);
+
+  const rowsHtml = rows
+    .map((t) => {
+      const webhookUrl = t.slug === 'default' ? `${BASE_URL}/line/webhook` : `${BASE_URL}/line/webhook/${t.slug}`;
+      return `
+        <tr>
+          <td>${escapeHtml(t.company_name)}<br><span style="color:#888; font-size:0.85em;">${escapeHtml(t.slug)}</span></td>
+          <td>${t.slug === 'default' ? '(成瀬さんの本業・課金対象外)' : statusLabel(t.subscription_status)}${
+            t.is_active ? '' : '<br><span style="color:#c00;">(非アクティブ)</span>'
+          }</td>
+          <td style="word-break:break-all; font-size:0.85em;">${escapeHtml(webhookUrl)}</td>
+          <td>
+            <a href="/admin/tenants/${t.id}/edit?${secretQs}">編集</a>
+            ${t.slug === 'default' ? '' : ` / <a href="/admin/tenants?${secretQs}">請求状況</a>`}
+          </td>
+        </tr>`;
+    })
+    .join('');
+
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>管理画面</title>
+    </head>
+    <body style="font-family: sans-serif; padding: 20px; max-width: 900px; margin: auto; line-height: 1.6;">
+      <h2>AI見積り添削 管理画面</h2>
+      <p><a href="/admin/tenants?${secretQs}">→ 全テナントの請求状況(今月分・概算)を見る</a></p>
+      <table style="width:100%; border-collapse: collapse;" cellpadding="10">
+        <thead>
+          <tr style="border-bottom: 2px solid #333; text-align:left;">
+            <th>会社名</th><th>状況</th><th>LINE Webhook URL</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rowsHtml || '<tr><td colspan="4">テナントがまだありません。</td></tr>'}
+        </tbody>
+      </table>
+    </body>
+    </html>
+  `);
+});
+
+// --- テナント個別の編集画面(LINEチャネル情報・担当者情報・有効/無効の切り替え) ---
+app.get('/admin/tenants/:id/edit', async (req, res) => {
+  if (!requireAdminSecret(req, res)) return;
+  const secretQs = `secret=${encodeURIComponent(req.query.secret)}`;
+
+  const tenant = await getTenantById(req.params.id);
+  if (!tenant) {
+    return res.status(404).send('<p>このテナントは見つかりません。</p>');
+  }
+
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>テナント編集 - ${escapeHtml(tenant.company_name)}</title>
+    </head>
+    <body style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; line-height: 1.6;">
+      <p><a href="/admin?${secretQs}">← 管理画面トップへ戻る</a></p>
+      <h2>${escapeHtml(tenant.company_name)} の編集</h2>
+      <form method="POST" action="/admin/tenants/${tenant.id}/edit?${secretQs}" style="display:flex; flex-direction:column; gap:14px;">
+        <label>
+          会社名<br>
+          <input type="text" name="companyName" required value="${escapeHtml(tenant.company_name)}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <label>
+          ご担当者メールアドレス<br>
+          <input type="email" name="adminEmail" value="${escapeHtml(tenant.admin_email || '')}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <label>
+          LINEチャネルシークレット<br>
+          <input type="text" name="lineChannelSecret" value="${escapeHtml(tenant.line_channel_secret || '')}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <label>
+          LINEチャネルアクセストークン(長期)<br>
+          <input type="text" name="lineChannelAccessToken" value="${escapeHtml(tenant.line_channel_access_token || '')}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <label>
+          添削内容を確認する担当者様のLINEユーザーID<br>
+          <input type="text" name="expertLineUserId" value="${escapeHtml(tenant.expert_line_user_id || '')}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        ${
+          tenant.slug === 'default'
+            ? ''
+            : `
+        <label style="display:flex; align-items:center; gap:8px;">
+          <input type="checkbox" name="isActive" value="true" ${tenant.is_active ? 'checked' : ''}>
+          このテナントを有効にする(オフにすると、LINE Webhookを受け付けなくなります)
+        </label>`
+        }
+        <button type="submit" style="font-size:16px; padding:12px 20px; background:#06c755; color:white; border:none; border-radius:8px;">
+          保存する
+        </button>
+      </form>
+    </body>
+    </html>
+  `);
+});
+
+app.post('/admin/tenants/:id/edit', async (req, res) => {
+  if (!requireAdminSecret(req, res)) return;
+  const secretQs = `secret=${encodeURIComponent(req.query.secret)}`;
+
+  const tenant = await getTenantById(req.params.id);
+  if (!tenant) {
+    return res.status(404).send('<p>このテナントは見つかりません。</p>');
+  }
+
+  const { companyName, adminEmail, lineChannelSecret, lineChannelAccessToken, expertLineUserId, isActive } =
+    req.body || {};
+
+  await pool.query(
+    `UPDATE tenants
+     SET company_name = $1, admin_email = $2, line_channel_secret = $3, line_channel_access_token = $4,
+         expert_line_user_id = $5, is_active = $6
+     WHERE id = $7`,
+    [
+      companyName || tenant.company_name,
+      adminEmail || null,
+      lineChannelSecret || null,
+      lineChannelAccessToken || null,
+      expertLineUserId || null,
+      tenant.slug === 'default' ? tenant.is_active : isActive === 'true',
+      tenant.id,
+    ]
+  );
+
+  res.redirect(`/admin?${secretQs}`);
+});
+
+// --- 月末請求の確認画面(成瀬さん用。各テナントの今月の使用量・概算請求額を一覧表示する) ---
+app.get('/admin/tenants', async (req, res) => {
+  if (!requireAdminSecret(req, res)) return;
+  const secretQs = `secret=${encodeURIComponent(req.query.secret)}`;
 
   const { rows } = await pool.query(`
     SELECT
@@ -841,6 +993,7 @@ app.get('/admin/tenants', async (req, res) => {
       <title>テナント請求状況</title>
     </head>
     <body style="font-family: sans-serif; padding: 20px; max-width: 900px; margin: auto; line-height: 1.6;">
+      <p><a href="/admin?${secretQs}">← 管理画面トップへ戻る</a></p>
       <h2>テナント請求状況(今月分・概算)</h2>
       <p style="color:#666; font-size:0.9em;">
         「概算請求額」は月額基本料金(${TENANT_BASE_MONTHLY_FEE_YEN.toLocaleString()}円) + 今月の使用ページ数 × ${TENANT_USAGE_YEN_PER_PAGE}円 で計算した目安です。
