@@ -12,6 +12,14 @@
  *   これまで単一事業(建設顧問セカンドオピニオン)として動いていたデータは、
  *   起動時に自動で「デフォルトテナント」(slug: 'default')に割り当てられる。
  *   これにより、既存のLINE公式アカウント・Webhook URLの設定は一切変更不要。
+ *
+ * セルフサインアップ・サブスクリプション課金について:
+ *   新しい会社は /signup から自分で登録する。登録直後は is_active = false,
+ *   subscription_status = 'pending' で作成され、Stripeのサブスクリプション決済
+ *   (月額基本料金 + 従量課金)が完了した時点で is_active = true, subscription_status = 'active'
+ *   に更新される(/stripe/webhook の checkout.session.completed で処理)。
+ *   「billing_config」テーブルは、Stripeの Meter / Price のIDを一度作成したら
+ *   再利用するための設定値(キー・バリュー)を保存する(stripeCheckout.js参照)。
  */
 
 const { Pool } = require('pg');
@@ -90,6 +98,19 @@ async function initDb() {
       expert_line_user_id TEXT,
       is_active BOOLEAN NOT NULL DEFAULT true,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // セルフサインアップ・サブスクリプション課金のために必要なカラムを追加(既存デプロイにも安全に適用できる)
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_status TEXT NOT NULL DEFAULT 'active'`);
+
+  // Stripeの Meter / Price のIDを一度作成したら再利用するための設定値保存テーブル
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS billing_config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
   `);
 
