@@ -284,6 +284,23 @@ async function handleLineEvent(event, tenant, lineClient) {
     // 元のPDFバッファを一時保存(添削書き込み・再抽出に使う)
     await savePendingPdf(tenant.id, userId, buffer);
 
+    // セルフサインアップした建設会社(テナント)のLINEアカウントでは、
+    // 送ってきた人への都度課金(1ページ500円)は行わない。
+    // その会社自身が成瀬さんに月額基本料金+従量課金(1ページ100円)を既に支払っているため、
+    // ここでさらに都度課金してしまうと二重課金になってしまう。
+    // (成瀬さんご自身の事業=デフォルトテナントのみ、従来通り都度課金する)
+    if (tenant.slug !== 'default') {
+      await markUserAsSeen(tenant.id, userId);
+      await lineClient.replyMessage(replyToken, {
+        type: 'text',
+        text:
+          `見積書を受け取りました（${pageCount}ページ）。AI一次チェックを開始します。結果は最短7日以内にお送りします。\n\n` +
+          LUMP_SUM_WARNING,
+      });
+      await startEstimateReview({ tenant, lineUserId: userId, pageCount });
+      return;
+    }
+
     const firstTime = await isFirstTimeUser(tenant.id, userId);
     const { amount, breakdown } = calculatePrice(pageCount, firstTime);
     console.log(breakdown);
