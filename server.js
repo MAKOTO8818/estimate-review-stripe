@@ -49,6 +49,7 @@ const {
   stripe,
 } = require('./stripeCheckout');
 const { reviewEstimate } = require('./aiReview');
+const { answerGeneralQuestion } = require('./lineFaqAgent');
 const { clientForTenant, middlewareForTenant } = require('./lineClient');
 const { extractStructuredPdf } = require('./pdfRows');
 const { annotatePdf } = require('./pdfAnnotate');
@@ -348,6 +349,14 @@ async function handleLineEvent(event, tenant, lineClient) {
   }
 
   if (message.type === 'text') {
+    // 見積書以外の質問(使い方・料金・解約など)には、AIが自動で回答する。
+    // 生成に失敗した場合は、従来通りの固定案内文にフォールバックする。
+    const aiAnswer = await answerGeneralQuestion(tenant, message.text || '');
+    if (aiAnswer) {
+      await lineClient.replyMessage(replyToken, { type: 'text', text: aiAnswer });
+      return;
+    }
+
     await lineClient.replyMessage(replyToken, {
       type: 'text',
       text:
@@ -1166,6 +1175,77 @@ app.get('/admin/tenants', async (req, res) => {
     </body>
     </html>
   `);
+});
+
+// --- 月次レポート用のJSON API(スケジュールタスクが毎月取得し、考察つきレポートを作る想定) ---
+app.get('/admin/report.json', async (req, res) => {
+  if (!requireAdminSecret(req, res)) return;
+
+  const summaryResult = await pool.query(`
+    SELECT
+      COUNT(*) AS total,
+      COUNT(*) FILTER (WHERE subscription_status = 'active' AND is_active) AS active,
+      COUNT(*) FILTER (WHERE subscription_status = 'canceled') AS canceled,
+      COUNT(*) FILTER (WHERE created_at >= date_trunc('month', now())) AS new_this_month
+    FROM tenants
+    WHERE slug != 'default'
+  `);
+  const summary = summaryResult.rows[0];
+
+  const listResult = await pool.query(`
+    SELECT slug, company_name, subscription_status, is_active, created_at
+    FROM tenants
+    WHERE slug != 'default'
+    ORDER BY created_at DESC
+  `);
+
+  const usageResult = await pool.query(`
+    SELECT COALESCE(SUM(quantity), 0) AS pages, COUNT(*) AS events
+    FROM tenant_usage_events
+    WHERE created_at >= date_trunc('month', now())
+  `);
+  const pagesThisMonth = Number(usageResult.rows[0].pages);
+  const eventsThisMonth = Number(usageResult.rows[0].events);
+
+  const defaultTenant = await getTenantBySlug('default');
+  let defaultReviewsThisMonth = 0;
+  if (defaultTenant) {
+    const defaultReviewsResult = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM pending_reviews WHERE tenant_id = $1 AND created_at >= date_trunc('month', now())`,
+      [defaultTenant.id]
+    );
+    defaultReviewsThisMonth = Number(defaultReviewsResult.rows[0].cnt);
+  }
+
+  const activeCount = Number(summary.active);
+
+  res.json({
+    generatedAt: new Date().toISOString(),
+    month: new Date().toISOString().slice(0, 7),
+    tenants: {
+      total: Number(summary.total),
+      active: activeCount,
+      canceled: Number(summary.canceled),
+      newThisMonth: Number(summary.new_this_month),
+      list: listResult.rows.map((t) => ({
+        slug: t.slug,
+        companyName: t.company_name,
+        status: t.subscription_status,
+        isActive: t.is_active,
+        createdAt: t.created_at,
+      })),
+    },
+    saasUsage: {
+      pagesThisMonth,
+      eventsThisMonth,
+      estimatedUsageRevenueYen: pagesThisMonth * TENANT_USAGE_YEN_PER_PAGE,
+      estimatedSubscriptionRevenueYen: activeCount * TENANT_BASE_MONTHLY_FEE_YEN,
+    },
+    defaultService: {
+      // 個人のお客様向け「建設顧問セカンドオピニオン」(default テナント)の今月の添削件数
+      reviewsThisMonth: defaultReviewsThisMonth,
+    },
+  });
 });
 
 // --- テナント(会社)追加用の暫定エンドポイント ---
