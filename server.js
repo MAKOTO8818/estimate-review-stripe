@@ -37,7 +37,13 @@ const multer = require('multer');
 const line = require('@line/bot-sdk');
 const { pool, initDb } = require('./db');
 const { calculatePrice } = require('./pricing');
-const { createEstimateReviewCheckoutSession, stripe } = require('./stripeCheckout');
+const {
+  createEstimateReviewCheckoutSession,
+  createTenantSubscriptionCheckoutSession,
+  finalizeTenantSubscriptionFromSession,
+  reportTenantUsage,
+  stripe,
+} = require('./stripeCheckout');
 const { reviewEstimate } = require('./aiReview');
 const { clientForTenant, middlewareForTenant } = require('./lineClient');
 const { extractStructuredPdf } = require('./pdfRows');
@@ -136,6 +142,17 @@ app.post(
 
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
+
+      // --- テナント(会社)のセルフサインアップ・サブスクリプション契約完了 ---
+      if (session.mode === 'subscription' && session.metadata?.purpose === 'tenant_subscription') {
+        console.log('✅ テナントのサブスクリプション契約完了:', { tenantId: session.metadata.tenant_id });
+        finalizeTenantSubscriptionFromSession(session.id).catch((err) => {
+          console.error('❌ テナント契約確定処理でエラー:', err);
+        });
+        return res.json({ received: true });
+      }
+
+      // --- お客様(LINEの利用者)による、見積り添削1回分の決済完了 ---
       const { tenant_id, line_user_id, page_count, is_first_time_user } = session.metadata || {};
 
       console.log('✅ 決済完了:', {
@@ -158,6 +175,21 @@ app.post(
       });
     }
 
+    // --- テナントがサブスクリプションを解約した場合 ---
+    if (event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object;
+      const tenantId = subscription.metadata?.tenant_id;
+      if (tenantId) {
+        console.log('🛑 テナントのサブスクリプションが解約されました:', { tenantId });
+        pool
+          .query(
+            `UPDATE tenants SET subscription_status = 'canceled', is_active = false WHERE id = $1`,
+            [tenantId]
+          )
+          .catch((err) => console.error('❌ サブスクリプション解約処理でエラー:', err));
+      }
+    }
+
     res.json({ received: true });
   }
 );
@@ -168,6 +200,8 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/line/webhook')) return next();
   express.json()(req, res, next);
 });
+// セルフサインアップのフォーム(application/x-www-form-urlencoded)を受け取るため
+app.use(express.urlencoded({ extended: true }));
 
 /**
  * LINE Webhookの共通処理。テナントが確定した後に呼ばれる。
@@ -383,6 +417,12 @@ async function startEstimateReview({ tenant, lineUserId, pageCount }) {
     // 学習機能の元データを蓄積(失敗しても添削フローは止めない)
     await saveLineItemsForLearning(tenant.id, reviewId, pages);
 
+    // セルフサインアップしたテナント(会社)であれば、従量課金(1ページあたり)を計上する
+    // (成瀬さん自身のデフォルトテナントはSaaS契約の対象外なので課金しない)
+    if (tenant.slug !== 'default') {
+      await reportTenantUsage(tenant, pageCount);
+    }
+
     if (tenant.expert_line_user_id) {
       await lineClient.pushMessage(tenant.expert_line_user_id, {
         type: 'text',
@@ -586,6 +626,164 @@ app.post('/admin/review/:id/approve', async (req, res) => {
   } catch (err) {
     console.error('❌ お客様への送信エラー:', err.message);
     res.status(500).send('<p>送信に失敗しました。時間をおいて再度お試しください。</p>');
+  }
+});
+
+// --- セルフサインアップ(新しい建設会社が自分で登録する画面) ---
+
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/; // 半角英小文字・数字・ハイフン、3〜40文字
+
+function signupFormPage({ error, values } = {}) {
+  const v = values || {};
+  const esc = (s) => escapeHtml(s || '');
+  return `
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>AI見積り添削 - 新規お申し込み</title>
+    </head>
+    <body style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; line-height: 1.6;">
+      <h2>AI見積り添削 新規お申し込み</h2>
+      <p style="color:#444;">
+        月額基本料金 5,000円 + 従量課金(見積り添削1ページあたり100円)のサブスクリプションです。<br>
+        お申し込み後、決済情報の登録画面に進みます。
+      </p>
+      ${error ? `<p style="color:#c00; background:#fde8e8; padding:12px; border-radius:8px;">${esc(error)}</p>` : ''}
+      <form method="POST" action="/signup" style="display:flex; flex-direction:column; gap:14px; margin-top:20px;">
+        <label>
+          会社名 <span style="color:#c00;">*</span><br>
+          <input type="text" name="companyName" required value="${esc(v.companyName)}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <label>
+          ご担当者メールアドレス <span style="color:#c00;">*</span><br>
+          <input type="email" name="adminEmail" required value="${esc(v.adminEmail)}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <label>
+          お申し込みID(半角英数字・ハイフン、3〜40文字。LINEのWebhook URLに使われます) <span style="color:#c00;">*</span><br>
+          <input type="text" name="slug" required pattern="[a-z0-9][a-z0-9-]{1,38}[a-z0-9]" value="${esc(v.slug)}" placeholder="例: yamada-kensetsu" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <hr style="width:100%; border:none; border-top:1px solid #ddd;">
+        <p style="margin:0; color:#666; font-size:0.9em;">
+          以下は、お客様自身のLINE公式アカウント(Messaging API)のチャネル情報です。
+          LINE Developersコンソールの「Messaging API設定」からご確認ください。
+        </p>
+        <label>
+          LINEチャネルシークレット <span style="color:#c00;">*</span><br>
+          <input type="text" name="lineChannelSecret" required value="${esc(v.lineChannelSecret)}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <label>
+          LINEチャネルアクセストークン(長期) <span style="color:#c00;">*</span><br>
+          <input type="text" name="lineChannelAccessToken" required value="${esc(v.lineChannelAccessToken)}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <label>
+          添削内容を確認する担当者様のLINEユーザーID<br>
+          <input type="text" name="expertLineUserId" value="${esc(v.expertLineUserId)}" style="width:100%; padding:8px; box-sizing:border-box;">
+        </label>
+        <button type="submit" style="font-size:16px; padding:14px 20px; background:#06c755; color:white; border:none; border-radius:8px;">
+          内容を確認してお支払い登録へ進む
+        </button>
+      </form>
+    </body>
+    </html>
+  `;
+}
+
+app.get('/signup', (req, res) => {
+  res.send(signupFormPage());
+});
+
+app.post('/signup', async (req, res) => {
+  const {
+    companyName,
+    adminEmail,
+    slug,
+    lineChannelSecret,
+    lineChannelAccessToken,
+    expertLineUserId,
+  } = req.body || {};
+
+  const values = { companyName, adminEmail, slug, lineChannelSecret, lineChannelAccessToken, expertLineUserId };
+
+  if (!companyName || !adminEmail || !slug || !lineChannelSecret || !lineChannelAccessToken) {
+    return res.status(400).send(signupFormPage({ error: '必須項目(*)が未入力です。', values }));
+  }
+  if (!SLUG_PATTERN.test(slug)) {
+    return res
+      .status(400)
+      .send(signupFormPage({ error: 'お申し込みIDは、半角英小文字・数字・ハイフンのみ、3〜40文字で入力してください。', values }));
+  }
+
+  const tenantId = crypto.randomUUID();
+  try {
+    await pool.query(
+      `INSERT INTO tenants
+         (id, slug, company_name, admin_email, line_channel_secret, line_channel_access_token, expert_line_user_id, is_active, subscription_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, false, 'pending')`,
+      [tenantId, slug, companyName, adminEmail, lineChannelSecret, lineChannelAccessToken, expertLineUserId || null]
+    );
+  } catch (err) {
+    if (err.code === '23505') {
+      return res
+        .status(409)
+        .send(signupFormPage({ error: `そのお申し込みID「${slug}」は既に使われています。別のIDをお試しください。`, values }));
+    }
+    console.error('❌ テナント作成エラー(セルフサインアップ):', err);
+    return res.status(500).send(signupFormPage({ error: '登録に失敗しました。時間をおいて再度お試しください。', values }));
+  }
+
+  try {
+    const { url } = await createTenantSubscriptionCheckoutSession({
+      tenantId,
+      companyName,
+      adminEmail,
+      successUrl: `${BASE_URL}/signup/complete?session_id={CHECKOUT_SESSION_ID}`,
+      cancelUrl: `${BASE_URL}/signup`,
+    });
+    res.redirect(303, url);
+  } catch (err) {
+    console.error('❌ サブスクリプション決済セッション作成エラー:', err);
+    res.status(500).send('<p>決済画面の作成に失敗しました。お手数ですが、サポートまでご連絡ください。</p>');
+  }
+});
+
+app.get('/signup/complete', async (req, res) => {
+  const sessionId = req.query.session_id;
+  if (!sessionId) {
+    return res.status(400).send('<p>不正なアクセスです。</p>');
+  }
+
+  try {
+    const result = await finalizeTenantSubscriptionFromSession(sessionId);
+    if (!result) {
+      return res.send('<p>決済が完了していないか、確認中です。しばらくしてから画面を再度開いてください。</p>');
+    }
+    const tenant = await getTenantById(result.tenantId);
+    const webhookUrl = `${BASE_URL}/line/webhook/${tenant.slug}`;
+
+    res.send(`
+      <!DOCTYPE html>
+      <html lang="ja">
+      <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>お申し込み完了</title></head>
+      <body style="font-family: sans-serif; padding: 20px; max-width: 600px; margin: auto; line-height: 1.6;">
+        <h2 style="color:#06c755;">✓ お申し込みが完了しました</h2>
+        <p><b>${escapeHtml(tenant.company_name)}</b> 様、ご契約ありがとうございます。</p>
+        <p>最後に、お客様のLINE Developersコンソールで、以下のWebhook URLを設定してください。</p>
+        <div style="background:#f5f5f5; padding:16px; border-radius:8px; word-break:break-all; margin:16px 0;">
+          ${escapeHtml(webhookUrl)}
+        </div>
+        <p style="color:#666; font-size:0.9em;">
+          設定方法: LINE Developersコンソール → 対象のチャネル → 「Messaging API設定」タブ →
+          「Webhook URL」欄に上記URLを貼り付けて保存 → 「Webhookの利用」をオンにする。
+        </p>
+        <p>設定が完了すれば、すぐにご利用いただけます。</p>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error('❌ サインアップ完了画面でエラー:', err);
+    res.status(500).send('<p>確認中にエラーが発生しました。お手数ですが、サポートまでご連絡ください。</p>');
   }
 });
 
