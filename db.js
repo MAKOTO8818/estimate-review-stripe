@@ -114,6 +114,23 @@ async function initDb() {
     );
   `);
 
+  // テナント(会社)ごとの従量課金(見積り添削1件あたり)の記録。
+  // Stripeに送信する前に必ずここへ記録することで、
+  //   ①Stripeへの送信が失敗しても使用量そのものを失わない(後で自動的に再送する)
+  //   ②review_idにユニーク制約があるため、同じレビューを二重に計上しない
+  //   ③月末請求額を自社側でも確認できる(/admin/tenants参照)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tenant_usage_events (
+      id SERIAL PRIMARY KEY,
+      tenant_id UUID NOT NULL REFERENCES tenants(id),
+      review_id UUID NOT NULL UNIQUE,
+      quantity INT NOT NULL,
+      reported_to_stripe BOOLEAN NOT NULL DEFAULT false,
+      reported_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
   // --- デフォルトテナント(これまでの単一事業)を用意する ---
   // 既存のLINE_CHANNEL_SECRET等の環境変数の値を、そのままデフォルトテナントの設定として使う。
   // slug='default' で既に存在する場合は何もしない。
