@@ -257,6 +257,7 @@ async function createTenantSubscriptionCheckoutSession({ tenantId, companyName, 
 
   const session = await stripe.checkout.sessions.create({
     mode: 'subscription',
+    managed_payments: { enabled: false },
     customer_email: adminEmail || undefined,
     line_items: [
       { price: basePriceId, quantity: 1 },
