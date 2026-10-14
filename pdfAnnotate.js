@@ -88,13 +88,27 @@ async function annotatePdf(originalPdfBuffer, structuredPages, findings, fontPat
       color,
     });
 
-    page.drawLine({
-      start: { x: Math.max(m.row.rightmostX1 - 200, MARGIN), y: m.row.yBottom - 1 },
-      end: { x: m.row.rightmostX1 + 2, y: m.row.yBottom - 1 },
-      thickness: 0.8,
-      color,
-      opacity: 0.5,
-    });
+    // 行の高さ(yTop-yBottom)が通常の1行分の文字サイズとして妥当な範囲かを確認し、
+    // 異常に大きい/数値が不正(NaN・無限大)な場合は、下線を描かず丸数字のみ表示する。
+    // (座標抽出の誤差で下線が想定外に長く・縦に伸びて見えるのを防ぐ安全策)
+    const rowHeight = m.row.yTop - m.row.yBottom;
+    const geometryLooksSane =
+      Number.isFinite(m.row.rightmostX1) &&
+      Number.isFinite(m.row.yBottom) &&
+      Number.isFinite(rowHeight) &&
+      rowHeight >= 0 &&
+      rowHeight < 40;
+
+    if (geometryLooksSane) {
+      const lineLength = 48; // 下線は短く固定し、行全体に渡る長い線にはしない
+      page.drawLine({
+        start: { x: Math.max(m.row.rightmostX1 - lineLength, MARGIN), y: m.row.yBottom - 1 },
+        end: { x: m.row.rightmostX1 + 2, y: m.row.yBottom - 1 },
+        thickness: 0.8,
+        color,
+        opacity: 0.5,
+      });
+    }
   }
 
   appendLegendPages(pdfDoc, jpFont, matched, unmatchedFindings);
