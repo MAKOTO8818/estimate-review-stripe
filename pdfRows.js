@@ -70,6 +70,17 @@ function extractWordsFromTextContent(textContent) {
     if (!raw || !raw.trim()) continue;
 
     const transform = item.transform; // [a, b, c, d, e, f]
+
+    // 文字の向き(ベースラインの角度)をチェックする。
+    // スキャンPDF内の一部の文字(スタンプ・ノイズ・OCRの誤検出など)が
+    // 横書きから大きく傾いていると、添削マーカー(丸数字・下線)の位置が
+    // ずれて「線が縦になる」ような見た目の崩れにつながるため、
+    // ほぼ水平(±8度)でない文字はここで除外して行の構造を壊さないようにする。
+    const angleRad = Math.atan2(transform[1], transform[0]);
+    const angleDeg = Math.abs((angleRad * 180) / Math.PI);
+    const normalizedAngle = angleDeg > 90 ? 180 - angleDeg : angleDeg;
+    if (normalizedAngle > 8) continue;
+
     const x0 = transform[4];
     const y = transform[5]; // ベースラインy座標(PDF座標系、左下原点)
     const width = item.width || 0;
