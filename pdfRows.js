@@ -40,7 +40,14 @@ async function extractStructuredPdf(pdfBuffer) {
     const viewport = page.getViewport({ scale: 1 });
     const textContent = await page.getTextContent();
 
-    const words = extractWordsFromTextContent(textContent);
+    // スマホのスキャンアプリ等で作られたPDFは、ページ全体の文字が
+    // (見た目は正しく表示されていても)データ上は90度/180度/270度
+    // 回転した向きで記録されていることがある。まずページ全体として
+    // 一番多い向き(支配的な回転角)を検出し、それを打ち消す形で
+    // 座標を読み取ることで、どの向きのPDFでも正しく行を認識できるようにする。
+    const rotationDeg = detectDominantRotation(textContent);
+
+    const words = extractWordsFromTextContent(textContent, rotationDeg);
     const rows = groupWordsIntoRows(words);
     const parsedRows = parseRows(rows);
 
@@ -48,6 +55,7 @@ async function extractStructuredPdf(pdfBuffer) {
       pageNumber: pageNum,
       width: viewport.width,
       height: viewport.height,
+      rotationDeg, // pdfAnnotate.js側で、正規化座標を実際のページ座標に戻すために使う
       rows: parsedRows,
     });
 
@@ -58,11 +66,86 @@ async function extractStructuredPdf(pdfBuffer) {
 }
 
 /**
+ * ページ内の文字の大半がどの向き(0/90/180/270度)で記録されているかを判定する。
+ * 文字数(重み)で多数決を取ることで、スタンプ等のノイズに引っ張られにくくする。
+ */
+function detectDominantRotation(textContent) {
+  const weightByAngle = { 0: 0, 90: 0, 180: 0, 270: 0 };
+
+  for (const item of textContent.items) {
+    const raw = item.str;
+    if (!raw || !raw.trim()) continue;
+
+    const [a, b] = item.transform;
+    if (a === 0 && b === 0) continue;
+
+    let deg = (Math.atan2(b, a) * 180) / Math.PI;
+    deg = ((deg % 360) + 360) % 360;
+
+    let nearest = 0;
+    let nearestDiff = Infinity;
+    for (const candidate of [0, 90, 180, 270]) {
+      const diff = Math.min(Math.abs(deg - candidate), 360 - Math.abs(deg - candidate));
+      if (diff < nearestDiff) {
+        nearestDiff = diff;
+        nearest = candidate;
+      }
+    }
+    weightByAngle[nearest] += raw.trim().length;
+  }
+
+  let best = 0;
+  let bestWeight = -1;
+  for (const candidate of [0, 90, 180, 270]) {
+    if (weightByAngle[candidate] > bestWeight) {
+      bestWeight = weightByAngle[candidate];
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
+ * ページの支配的な回転角を打ち消す向きに座標を回転し、
+ * 「読む向きが常に+x方向」になる正規化座標系に変換する。
+ */
+function normalizePoint(x, y, rotationDeg) {
+  switch (rotationDeg) {
+    case 90:
+      return { x: y, y: -x };
+    case 180:
+      return { x: -x, y: -y };
+    case 270:
+      return { x: -y, y: x };
+    default:
+      return { x, y };
+  }
+}
+
+/**
+ * normalizePoint の逆変換。正規化座標(行の認識用)から、
+ * 実際のPDFページ座標(pdf-libで描画する際に使う座標系)に戻す。
+ */
+function denormalizePoint(x, y, rotationDeg) {
+  switch (rotationDeg) {
+    case 90:
+      return { x: -y, y: x };
+    case 180:
+      return { x: -x, y: -y };
+    case 270:
+      return { x: y, y: -x };
+    default:
+      return { x, y };
+  }
+}
+
+/**
  * pdfjsのtextContent.itemsから「単語」レベルの位置情報付きトークンを作る。
  * 1つのitemに複数の単語(スペース区切り)が含まれる場合は、
  * 文字数比率でx座標を按分して分割する(簡易的な近似)。
+ * 座標は、ページの支配的な回転角を打ち消した「正規化座標系」(読む向きが+x)で返す。
  */
-function extractWordsFromTextContent(textContent) {
+function extractWordsFromTextContent(textContent, rotationDeg) {
   const words = [];
 
   for (const item of textContent.items) {
@@ -71,18 +154,22 @@ function extractWordsFromTextContent(textContent) {
 
     const transform = item.transform; // [a, b, c, d, e, f]
 
-    // 文字の向き(ベースラインの角度)をチェックする。
-    // スキャンPDF内の一部の文字(スタンプ・ノイズ・OCRの誤検出など)が
-    // 横書きから大きく傾いていると、添削マーカー(丸数字・下線)の位置が
-    // ずれて「線が縦になる」ような見た目の崩れにつながるため、
-    // ほぼ水平(±8度)でない文字はここで除外して行の構造を壊さないようにする。
+    // 文字の向き(ベースラインの角度)が、ページの支配的な向きから
+    // 大きく外れている場合は、スタンプ・ノイズ・OCRの誤検出とみなして除外する。
+    // (許容範囲は広め(±20度)に取り、スキャンの傾き程度では除外されないようにする)
     const angleRad = Math.atan2(transform[1], transform[0]);
-    const angleDeg = Math.abs((angleRad * 180) / Math.PI);
-    const normalizedAngle = angleDeg > 90 ? 180 - angleDeg : angleDeg;
-    if (normalizedAngle > 8) continue;
+    let angleDeg = (angleRad * 180) / Math.PI;
+    angleDeg = ((angleDeg % 360) + 360) % 360;
+    const diffFromDominant = Math.min(
+      Math.abs(angleDeg - rotationDeg),
+      360 - Math.abs(angleDeg - rotationDeg)
+    );
+    if (diffFromDominant > 20) continue;
 
-    const x0 = transform[4];
-    const y = transform[5]; // ベースラインy座標(PDF座標系、左下原点)
+    // 原点(文字の開始位置)を正規化座標系に変換する
+    const origin = normalizePoint(transform[4], transform[5], rotationDeg);
+    const x0 = origin.x;
+    const y = origin.y; // 正規化座標系でのベースラインy座標
     const width = item.width || 0;
     const height = Math.hypot(transform[2], transform[3]) || Math.abs(item.height) || 10;
 
@@ -100,6 +187,7 @@ function extractWordsFromTextContent(textContent) {
 
       words.push({
         text: tok,
+        // 正規化座標系では、読む向きは常に+x方向になる
         x0: x0 + width * startFrac,
         x1: x0 + width * endFrac,
         y,
@@ -190,4 +278,4 @@ function parseRows(rows) {
   return result;
 }
 
-module.exports = { extractStructuredPdf, NUM_RE };
+module.exports = { extractStructuredPdf, NUM_RE, denormalizePoint };
