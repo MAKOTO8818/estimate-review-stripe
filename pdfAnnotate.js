@@ -12,6 +12,7 @@
 const fs = require('fs');
 const { PDFDocument, rgb } = require('pdf-lib');
 const fontkit = require('@pdf-lib/fontkit');
+const { denormalizePoint } = require('./pdfRows');
 
 const SEVERITY_COLOR = {
   high: rgb(0.82, 0.11, 0.11),
@@ -65,8 +66,19 @@ async function annotatePdf(originalPdfBuffer, structuredPages, findings, fontPat
     const { width } = page.getSize();
     const color = SEVERITY_COLOR[m.severity] || SEVERITY_COLOR.medium;
 
-    const cx = Math.min(m.row.rightmostX1 + 16, width - 18);
-    const cy = m.row.yCenter;
+    // pdfRows.js は、ページが回転した向きで記録されていても正しく行を認識できるよう、
+    // その回転を打ち消した「正規化座標系」で row の座標(rightmostX1, yCenter など)を返す。
+    // ここで実際にPDFへ描画する前に、ページ本来の座標系に戻す(denormalizePoint)必要がある。
+    const pageData = structuredPages.find((p) => p.pageNumber === m.page);
+    const rotationDeg = pageData ? pageData.rotationDeg || 0 : 0;
+
+    const normCx = m.row.rightmostX1 + 16;
+    const normCy = m.row.yCenter;
+    let { x: cx, y: cy } = denormalizePoint(normCx, normCy, rotationDeg);
+    if (rotationDeg === 0) {
+      // 回転なしの通常ページでは、従来通り右端からはみ出さないようクランプする
+      cx = Math.min(cx, width - 18);
+    }
 
     page.drawCircle({
       x: cx,
@@ -101,9 +113,13 @@ async function annotatePdf(originalPdfBuffer, structuredPages, findings, fontPat
 
     if (geometryLooksSane) {
       const lineLength = 48; // 下線は短く固定し、行全体に渡る長い線にはしない
+      const normStart = { x: m.row.rightmostX1 - lineLength, y: m.row.yBottom - 1 };
+      const normEnd = { x: m.row.rightmostX1 + 2, y: m.row.yBottom - 1 };
+      const start = denormalizePoint(normStart.x, normStart.y, rotationDeg);
+      const end = denormalizePoint(normEnd.x, normEnd.y, rotationDeg);
       page.drawLine({
-        start: { x: Math.max(m.row.rightmostX1 - lineLength, MARGIN), y: m.row.yBottom - 1 },
-        end: { x: m.row.rightmostX1 + 2, y: m.row.yBottom - 1 },
+        start,
+        end,
         thickness: 0.8,
         color,
         opacity: 0.5,
