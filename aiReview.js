@@ -21,6 +21,7 @@
  */
 
 const Anthropic = require('@anthropic-ai/sdk');
+const { fetchPriceStatsGroupedByItem, matchStatsToPages, buildPriceStatsPromptBlock } = require('./priceStats');
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -38,8 +39,11 @@ const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」
 # 厳守事項
 - あなた自身が最終判断者ではありません。「専門家が確認すべき論点」を洗い出すのが仕事です。
 - 断定的な「これは不当請求です」等の表現は使わない。「相場と比べて高い可能性がある」等、根拠とセットで指摘する。
-- 単価に言及する場合は、あなたの学習知識に基づく一般的な相場観であることを明記し(例:「一般的な相場は◯◯円/ m程度と思われます(AI推定・参考値)」)、
-  リアルタイムの最新相場ではない可能性がある旨がわかるようにする。
+- 単価に言及する場合、「本サービスの過去実績データに基づく単価統計」が提供されている項目については、
+  その実績データ(件数・平均・範囲)を根拠として明示し、今回の単価がその範囲内か、どの程度乖離しているかを具体的に述べること。
+  (例:「過去12件の実績平均は3,200円/m²ですが、本見積りは5,000円/m²で、実績平均より約56%高くなっています(本サービス実績データに基づく)」)
+- 上記の実績データが提供されていない項目については、あなたの学習知識に基づく一般的な相場観であることを明記し
+  (例:「一般的な相場は◯◯円/ m程度と思われます(AI推定・参考値)」)、リアルタイムの最新相場ではない可能性がある旨がわかるようにする。
 - 見積書に記載のない情報を推測で補わない。不明な点は「不明」「要確認」と明記する。
 - 個人や会社を誹謗中傷しない。あくまで見積書の記載内容に対する客観的な指摘に留める。
 - findings の "page" と "itemText" は、入力データに登場する値をそのまま(一字一句変えずに)使うこと。
@@ -216,6 +220,8 @@ function repairTruncatedJson(rawJson) {
  * @param {Array<PageData>} structuredPages pdfRows.extractStructuredPdf() が返す pages 配列
  * @param {object} [context] 追加情報(工事種別など、わかれば精度が上がる)
  * @param {string} [context.workType] 例: "外壁塗装", "リフォーム", "注文住宅"
+ * @param {import('pg').Pool} [context.pool] DB接続プール。渡された場合、過去の見積り実績(estimate_line_items)
+ *   から単価統計を集計し、「学習型」としてプロンプトに含める。渡されない/取得失敗時は従来通り(AIの一般知識のみ)で動作する。
  * @returns {Promise<object>} { summary, findings, unclearItems, expertChecklist }
  *   findings には、コード側の機械チェック(arithmeticCheck)の結果もマージして含まれる。
  */
@@ -226,11 +232,26 @@ async function reviewEstimate(structuredPages, context = {}) {
 
   const structuredText = buildStructuredText(structuredPages);
 
+  // 学習型AI添削: 過去に処理した見積りの単価実績を集計し、該当する項目があれば
+  // 「本サービス実績データ」としてプロンプトに含める。使えばAIの判断材料が増えていく。
+  let priceStatsBlock = null;
+  if (context.pool) {
+    try {
+      const allStats = await fetchPriceStatsGroupedByItem(context.pool);
+      const matchedStats = matchStatsToPages(structuredPages, allStats);
+      priceStatsBlock = buildPriceStatsPromptBlock(matchedStats);
+    } catch (err) {
+      console.error('⚠️ 学習型単価統計の組み込みに失敗しました(通常モードで続行します):', err.message);
+    }
+  }
+
   const userMessage = [
     context.workType ? `工事種別: ${context.workType}` : null,
     '以下は見積書PDFから、ページ・行単位で抽出した構造化データです。上記の観点でチェックしてください。',
     '---',
     structuredText,
+    priceStatsBlock ? '---' : null,
+    priceStatsBlock,
   ]
     .filter(Boolean)
     .join('\n');
