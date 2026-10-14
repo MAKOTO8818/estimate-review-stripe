@@ -416,7 +416,9 @@ async function startEstimateReview({ tenant, lineUserId, pageCount }) {
 
   try {
     const { pages } = await extractStructuredPdf(pdfBuffer);
-    const result = await reviewEstimate(pages);
+        // pool を渡すことで、過去の見積り実績(estimate_line_items)から単価統計を集計し、
+    // 「学習型AI添削」としてAIの判断材料に組み込む(件数が少ないうちは自動的に使われない)。
+    const result = await reviewEstimate(pages, { pool });
     console.log('🤖 AI一次チェック完了:', {
       tenant: tenant.slug,
       lineUserId,
