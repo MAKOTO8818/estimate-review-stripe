@@ -57,6 +57,9 @@ const { annotatePdf } = require('./pdfAnnotate');
 const app = express();
 const PORT = process.env.PORT || 4242;
 
+// --- 公開LP(トップページ)の配信。/public/index.html が "/" でそのまま表示される ---
+app.use(express.static(path.join(__dirname, 'public')));
+
 // 「一式」注意書き(お客様が利用前に必ず目にするよう、案内文・受付確認メッセージの両方に挿入する)
 const LUMP_SUM_WARNING =
   '【ご利用前の注意】内訳が「一式」とだけ記載され、数量・単価の内訳がない項目は、AIが金額の妥当性を判断できません。' +
