@@ -256,16 +256,40 @@ async function reviewEstimate(structuredPages, context = {}) {
     .filter(Boolean)
     .join('\n');
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-5',
-    max_tokens: 8192,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: 'user', content: userMessage }],
-  });
+  // Anthropic APIが混雑時などに一時的に空応答を返すことがあるため、
+  // テキストブロックが取得できなかった場合は1回だけ自動的に再試行する。
+  const MAX_ATTEMPTS = 2;
+  let response = null;
+  let textBlock = null;
+  let lastDiagnostics = null;
 
-  const textBlock = response.content.find((block) => block.type === 'text');
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    response = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 8192,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userMessage }],
+    });
+
+    textBlock = response.content.find((block) => block.type === 'text');
+    if (textBlock) break;
+
+    lastDiagnostics = {
+      attempt,
+      stopReason: response.stop_reason,
+      contentTypes: response.content.map((b) => b.type),
+    };
+    console.warn(
+      `⚠️ AIからテキスト応答が得られませんでした(試行${attempt}/${MAX_ATTEMPTS})。stop_reason=${response.stop_reason}, content types=${JSON.stringify(
+        lastDiagnostics.contentTypes
+      )}`
+    );
+  }
+
   if (!textBlock) {
-    throw new Error('AIからのテキスト応答が取得できませんでした。');
+    throw new Error(
+      `AIからのテキスト応答が取得できませんでした(${MAX_ATTEMPTS}回試行)。診断情報: ${JSON.stringify(lastDiagnostics)}`
+    );
   }
 
   let aiResult;
