@@ -553,6 +553,24 @@ app.get('/files/:filename', async (req, res) => {
   res.send(review.pdfData);
 });
 
+// --- 開発用: このレビューでPDFから実際に抽出された行データ(数量・単価・金額など)をそのまま確認する ---
+// AIの指摘がおかしい/少ないときに、「AIの判断ミス」なのか「そもそもPDF抽出の時点で単価が読めていない」
+// のかを切り分けるためのデバッグ用エンドポイント。添削済みPDF(annotatePdfで注釈を追加したもの)からでも
+// 元のテキスト情報は保持されているため、再抽出すれば元データを確認できる。
+app.get('/admin/debug/pdf-rows/:id', async (req, res) => {
+  const review = await getReview(req.params.id);
+  if (!review || !review.pdfData) {
+    return res.status(404).send('<p>このレビューは見つかりません。URLが正しいかご確認ください。</p>');
+  }
+  try {
+    const { pages } = await extractStructuredPdf(review.pdfData);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(JSON.stringify({ reviewId: review.id, pages }, null, 2));
+  } catch (err) {
+    res.status(500).send(`<p>抽出データの再生成に失敗しました: ${escapeHtml(err.message)}</p>`);
+  }
+});
+
 // --- 専門家向け 確認・承認画面 ---
 app.get('/admin/review/:id', async (req, res) => {
   const review = await getReview(req.params.id);
@@ -560,6 +578,7 @@ app.get('/admin/review/:id', async (req, res) => {
     return res.status(404).send('<p>このレビューは見つかりません。URLが正しいかご確認ください。</p>');
   }
   const pdfUrl = `${BASE_URL}/files/${review.id}.pdf`;
+  const debugRowsUrl = `${BASE_URL}/admin/debug/pdf-rows/${review.id}`;
   const findingsHtml = review.findings
     .map(
       (f, i) => `
@@ -586,6 +605,9 @@ app.get('/admin/review/:id', async (req, res) => {
       <p style="margin: 20px 0;">
         <a href="${pdfUrl}" target="_blank" style="display:inline-block; font-size:16px; padding:12px 20px; background:#1a73e8; color:white; border-radius:8px; text-decoration:none;">
           添削済みPDFを開く
+        </a>
+        <a href="${debugRowsUrl}" target="_blank" style="display:inline-block; font-size:13px; padding:12px 16px; margin-left:8px; background:#eee; color:#333; border-radius:8px; text-decoration:none;">
+          (開発用)抽出データを確認
         </a>
       </p>
 
