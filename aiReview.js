@@ -42,6 +42,9 @@ const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」
 各行は「項目名 | 数量 | 単位 | 単価 | 金額」の形式で渡されます(値が取得できない項目は "-" になります)。
 抽出処理の都合上、まれに項目名や数値が誤って分割・結合されていることがあります。
 明らかにおかしい場合は "unclearItems" に記載してください。
+単価の欄に「(※見積書に単価の記載なし。金額÷数量から逆算した参考値)」と付いている場合は、
+見積書に単価が直接印字されていなかったため、数量と金額から機械的に逆算した値です。
+推測ではなく確実な計算なので、通常の単価と同様に妥当性チェックの対象にしてください。
 ※ページをまたいだ重複計上の確認は別の仕組み(機械的チェック)で行うため、ここでは行わなくて構いません。
 
 # 厳守事項(最重要・必ず守ること)
@@ -202,8 +205,10 @@ function buildStructuredTextForPage(page) {
     return lines.join('\n');
   }
   for (const row of page.rows) {
+    const unitPriceLabel =
+      row.unitPrice && row.unitPriceDerived ? `${row.unitPrice}(※見積書に単価の記載なし。金額÷数量から逆算した参考値)` : row.unitPrice ?? '-';
     lines.push(
-      `項目: ${row.item} | 数量: ${row.qty ?? '-'} | 単位: ${row.unit ?? '-'} | 単価: ${row.unitPrice ?? '-'} | 金額: ${row.amount ?? '-'}`
+      `項目: ${row.item} | 数量: ${row.qty ?? '-'} | 単位: ${row.unit ?? '-'} | 単価: ${unitPriceLabel} | 金額: ${row.amount ?? '-'}`
     );
   }
   return lines.join('\n');
