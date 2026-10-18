@@ -107,49 +107,27 @@ async function findOrCreateCustomerForLineUser(tenantId, lineUserId) {
 }
 
 /**
- * 指定した顧客に登録済みの支払い方法(カード)のうち、最も新しいものを1件返す。無ければnull。
- * (2回目以降のお客様に対して、カード入力なしで即時決済できるかどうかの判定に使う)
+ * 顧客に登録済みのカード(支払い方法)を、次回以降のCheckoutで「保存済みのカードとして選択できる」
+ * 状態にする(Stripeの allow_redisplay が 'always' になっていないと、Checkout画面に
+ * 選択肢として表示されない)。古い方式で保存されたカードは allow_redisplay が未設定のことがあるため、
+ * 決済ページを開く前に毎回呼び出して揃えておく。
  * @param {string} customerId
- * @returns {Promise<object|null>} Stripe PaymentMethod オブジェクト、またはnull
  */
-async function getSavedPaymentMethodForCustomer(customerId) {
+async function ensureSavedPaymentMethodsAreReusable(customerId) {
   const methods = await stripe.paymentMethods.list({
     customer: customerId,
     type: 'card',
-    limit: 1,
+    limit: 100,
   });
-  return methods.data.length > 0 ? methods.data[0] : null;
-}
-
-/**
- * 保存済みのカードに対して、その場で即時決済する(見積り添削1件分の都度課金用)。
- * 2回目以降のお客様が、決済ページでカード番号を再入力しなくて済むようにするための関数。
- * off_session(本人がその場で操作していない決済)として確定するため、カードの状態によっては
- * 追加認証(3Dセキュア等)が必要になり失敗することがある。その場合は例外を投げるので、
- * 呼び出し側で通常のCheckout Session(カード入力あり)にフォールバックすること。
- * @param {object} params
- * @param {string} params.customerId
- * @param {string} params.paymentMethodId
- * @param {number} params.amount 請求金額(円、整数)
- * @param {string} params.description
- * @param {object} [params.metadata]
- * @param {string} params.idempotencyKey 同じ決済を誤って二重に実行しないための冪等キー
- * @returns {Promise<object>} Stripe PaymentIntent オブジェクト
- */
-async function chargeSavedCardImmediately({ customerId, paymentMethodId, amount, description, metadata, idempotencyKey }) {
-  return stripe.paymentIntents.create(
-    {
-      amount,
-      currency: 'jpy',
-      customer: customerId,
-      payment_method: paymentMethodId,
-      off_session: true,
-      confirm: true,
-      description,
-      metadata,
-    },
-    { idempotencyKey }
-  );
+  for (const pm of methods.data) {
+    if (pm.allow_redisplay !== 'always') {
+      try {
+        await stripe.paymentMethods.update(pm.id, { allow_redisplay: 'always' });
+      } catch (err) {
+        console.warn(`⚠️ 支払い方法(${pm.id})を「次回以降も選択可能」に更新できませんでした:`, err.message);
+      }
+    }
+  }
 }
 
 /**
@@ -180,6 +158,9 @@ async function createEstimateReviewCheckoutSession({
   }
 
   const customerId = await findOrCreateCustomerForLineUser(tenantId, lineUserId);
+  // 2回目以降のお客様が、決済ページで保存済みのカードを選んでそのまま払えるようにする
+  // (古い方式で保存されたカードは、このひと手間が無いとCheckout画面に出てこないことがある)
+  await ensureSavedPaymentMethodsAreReusable(customerId);
 
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
@@ -188,6 +169,10 @@ async function createEstimateReviewCheckoutSession({
     payment_intent_data: {
       // このお客様の今後の決済のためにカードを保存する(Stripeが安全に保管。こちらのサーバーには残らない)
       setup_future_usage: 'off_session',
+    },
+    // お客様が「保存する」を選んだカードを、次回以降のCheckoutで選択肢として表示させるための設定
+    saved_payment_method_options: {
+      payment_method_save: 'enabled',
     },
     line_items: [
       {
@@ -512,8 +497,6 @@ async function retryUnreportedTenantUsage() {
 module.exports = {
   createEstimateReviewCheckoutSession,
   findOrCreateCustomerForLineUser,
-  getSavedPaymentMethodForCustomer,
-  chargeSavedCardImmediately,
   createTenantSubscriptionCheckoutSession,
   finalizeTenantSubscriptionFromSession,
   recordAndReportTenantUsage,
