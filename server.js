@@ -39,6 +39,9 @@ const { pool, initDb } = require('./db');
 const { calculatePrice } = require('./pricing');
 const {
   createEstimateReviewCheckoutSession,
+  findOrCreateCustomerForLineUser,
+  getSavedPaymentMethodForCustomer,
+  chargeSavedCardImmediately,
   createTenantSubscriptionCheckoutSession,
   finalizeTenantSubscriptionFromSession,
   recordAndReportTenantUsage,
@@ -333,6 +336,48 @@ async function handleLineEvent(event, tenant, lineClient) {
       });
       await startEstimateReview({ tenant, lineUserId: userId, pageCount });
       return;
+    }
+
+    // --- 2回目以降で、既にカードが保存されている場合は、決済ページ(カード入力)を開かず、
+    //     その場で保存済みのカードに即時決済して、添削をすぐに開始する。
+    //     (カードの期限切れ・追加認証が必要などで失敗した場合は、通常のCheckoutにフォールバックする) ---
+    try {
+      const customerId = await findOrCreateCustomerForLineUser(tenant.id, userId);
+      const savedMethod = await getSavedPaymentMethodForCustomer(customerId);
+
+      if (savedMethod) {
+        await chargeSavedCardImmediately({
+          customerId,
+          paymentMethodId: savedMethod.id,
+          amount,
+          description: `AI見積り添削(${pageCount}ページ分)`,
+          metadata: {
+            tenant_id: tenant.id,
+            line_user_id: userId,
+            page_count: String(pageCount),
+            is_first_time_user: String(firstTime),
+          },
+          // LINEのメッセージIDを冪等キーに使うことで、同じメッセージが万一再配信されても
+          // 二重に決済されないようにする。
+          idempotencyKey: `estimate-review-charge-${message.id}`,
+        });
+
+        await markUserAsSeen(tenant.id, userId);
+        await lineClient.replyMessage(replyToken, {
+          type: 'text',
+          text:
+            `見積書を受け取りました（${pageCount}ページ）。${breakdown}\n` +
+            `登録済みのカードでお支払い（${amount.toLocaleString()}円）が完了しました。AI一次チェックを開始します。結果は最短7日以内にお送りします。\n\n` +
+            LUMP_SUM_WARNING,
+        });
+        await startEstimateReview({ tenant, lineUserId: userId, pageCount });
+        return;
+      }
+    } catch (err) {
+      console.warn(
+        '⚠️ 保存済みカードでの即時決済に失敗しました。通常の決済ページ(カード入力)にフォールバックします:',
+        err.message
+      );
     }
 
     const { url } = await createEstimateReviewCheckoutSession({
