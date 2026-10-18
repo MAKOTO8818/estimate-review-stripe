@@ -29,7 +29,9 @@ function toHalfWidth(tok) {
     .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
     .replace(/，/g, ',')
     .replace(/．/g, '.')
-    .replace(/－/g, '-');
+    .replace(/－/g, '-')
+    .replace(/^[¥￥]/, ''); // 金額の先頭に付く円マークを除去(付いたままだと数値と認識できず、
+    // 金額の列がまるごと読み取れなくなる。実際のPDFでかなりの頻度で発生していた)
 }
 
 /**
