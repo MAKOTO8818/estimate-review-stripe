@@ -107,6 +107,52 @@ async function findOrCreateCustomerForLineUser(tenantId, lineUserId) {
 }
 
 /**
+ * 指定した顧客に登録済みの支払い方法(カード)のうち、最も新しいものを1件返す。無ければnull。
+ * (2回目以降のお客様に対して、カード入力なしで即時決済できるかどうかの判定に使う)
+ * @param {string} customerId
+ * @returns {Promise<object|null>} Stripe PaymentMethod オブジェクト、またはnull
+ */
+async function getSavedPaymentMethodForCustomer(customerId) {
+  const methods = await stripe.paymentMethods.list({
+    customer: customerId,
+    type: 'card',
+    limit: 1,
+  });
+  return methods.data.length > 0 ? methods.data[0] : null;
+}
+
+/**
+ * 保存済みのカードに対して、その場で即時決済する(見積り添削1件分の都度課金用)。
+ * 2回目以降のお客様が、決済ページでカード番号を再入力しなくて済むようにするための関数。
+ * off_session(本人がその場で操作していない決済)として確定するため、カードの状態によっては
+ * 追加認証(3Dセキュア等)が必要になり失敗することがある。その場合は例外を投げるので、
+ * 呼び出し側で通常のCheckout Session(カード入力あり)にフォールバックすること。
+ * @param {object} params
+ * @param {string} params.customerId
+ * @param {string} params.paymentMethodId
+ * @param {number} params.amount 請求金額(円、整数)
+ * @param {string} params.description
+ * @param {object} [params.metadata]
+ * @param {string} params.idempotencyKey 同じ決済を誤って二重に実行しないための冪等キー
+ * @returns {Promise<object>} Stripe PaymentIntent オブジェクト
+ */
+async function chargeSavedCardImmediately({ customerId, paymentMethodId, amount, description, metadata, idempotencyKey }) {
+  return stripe.paymentIntents.create(
+    {
+      amount,
+      currency: 'jpy',
+      customer: customerId,
+      payment_method: paymentMethodId,
+      off_session: true,
+      confirm: true,
+      description,
+      metadata,
+    },
+    { idempotencyKey }
+  );
+}
+
+/**
  * @param {object} params
  * @param {string} params.tenantId テナント(会社)のID
  * @param {string} params.tenantName 商品名表示に使う会社名
@@ -466,6 +512,8 @@ async function retryUnreportedTenantUsage() {
 module.exports = {
   createEstimateReviewCheckoutSession,
   findOrCreateCustomerForLineUser,
+  getSavedPaymentMethodForCustomer,
+  chargeSavedCardImmediately,
   createTenantSubscriptionCheckoutSession,
   finalizeTenantSubscriptionFromSession,
   recordAndReportTenantUsage,
