@@ -42,6 +42,11 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+// [診断用] このファイルが読み込まれた時点でRenderログに1行出す。
+// 「貼り替え後のコードが実際にデプロイされて動いているか」を、見積書をテストしなくても
+// デプロイ直後のログだけで確認できるようにするための目印(ビルドごとに内容を変える必要はない)。
+console.error('[診断] aiReview.js 読み込み: 単価の全項目チェック必須版(web検索15回/ページ, max_tokens16000) 起動');
+
 const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」のAI一次チェック担当です。
 建築・リフォーム工事の見積書を、ページ単位で精査し、専門家(人間)が最終確認しやすい形に整理することが役割です。
 
@@ -416,6 +421,7 @@ async function reviewSinglePage(page, opts) {
   let response = null;
   let textBlock = null;
   let lastDiagnostics = null;
+  let webSearchCallCount = 0; // [診断用] 実際にweb_searchが何回呼ばれたかをRenderログで確認できるようにする
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_PAGE; attempt++) {
     const messages = [{ role: 'user', content: userMessage }];
@@ -428,6 +434,10 @@ async function reviewSinglePage(page, opts) {
         messages,
         tools,
       });
+
+      webSearchCallCount += response.content.filter(
+        (b) => b.type === 'server_tool_use' && b.name === 'web_search'
+      ).length;
 
       if (response.stop_reason !== 'pause_turn') break;
       // 検索の続きがある場合、直前の応答をそのまま履歴に積んで継続する
@@ -480,10 +490,19 @@ async function reviewSinglePage(page, opts) {
     }
   }
 
+  const findings = (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai' }));
+
+  // [診断用] このページで実際に何件のfindingsが出て、web_searchが何回呼ばれたかをRenderログに出す。
+  // 「プロンプトを直したのにfindingsが0件のまま」という状況が、デプロイ未反映なのか、
+  // AIがweb_searchを呼んでいないのか、他の原因なのかをログだけで切り分けられるようにするため。
+  console.error(
+    `[診断] ${page.pageNumber}ページ(文字): 行数=${(page.rows || []).length}, web検索回数=${webSearchCallCount}, findings件数=${findings.length}`
+  );
+
   return {
     pageNumber: page.pageNumber,
     summary: aiResult.summary || '',
-    findings: (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai' })),
+    findings,
     unclearItems: aiResult.unclearItems || [],
     expertChecklist: aiResult.expertChecklist || [],
     truncated: wasTruncated,
@@ -546,6 +565,7 @@ async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
   let response = null;
   let textBlock = null;
   let lastDiagnostics = null;
+  let webSearchCallCount = 0; // [診断用] 実際にweb_searchが何回呼ばれたかをRenderログで確認できるようにする
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_PAGE; attempt++) {
     const messages = [{ role: 'user', content: userContent }];
@@ -558,6 +578,10 @@ async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
         messages,
         tools,
       });
+
+      webSearchCallCount += response.content.filter(
+        (b) => b.type === 'server_tool_use' && b.name === 'web_search'
+      ).length;
 
       if (response.stop_reason !== 'pause_turn') break;
       messages.push({ role: 'assistant', content: response.content });
@@ -607,10 +631,16 @@ async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
     }
   }
 
+  const findings = (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai-vision' }));
+
+  console.error(
+    `[診断] ${pageNumber}ページ(画像): web検索回数=${webSearchCallCount}, findings件数=${findings.length}`
+  );
+
   return {
     pageNumber,
     summary: aiResult.summary || '',
-    findings: (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai-vision' })),
+    findings,
     unclearItems: aiResult.unclearItems || [],
     expertChecklist: aiResult.expertChecklist || [],
     truncated: wasTruncated,
@@ -718,6 +748,13 @@ async function reviewEstimate(structuredPages, context = {}) {
   const unclearItems = [...new Set(pageResults.flatMap((r) => r.unclearItems))];
   const expertChecklist = [...new Set(pageResults.flatMap((r) => r.expertChecklist))];
   const truncated = pageResults.some((r) => r.truncated);
+
+  // [診断用] 見積書全体の結果をRenderログに1行で出す。「貼り替え後のコードが実際に動いているか」
+  // 「findingsが本当に0件なのか」を、LINE側の表示を待たずログだけで確認できるようにする。
+  console.error(
+    `[診断] 添削完了(全体): 対象ページ=${pageResults.length}(文字${textPageResults.length}+画像${scannedPageResults.length}), ` +
+      `機械チェック=${machineFindings.length}件, AI指摘(重複除去後)=${dedupedAiFindings.length}件, 合計findings=${findings.length}件`
+  );
 
   return {
     summary,
