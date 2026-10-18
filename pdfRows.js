@@ -18,6 +18,31 @@ const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
 // 先頭が数字で、カンマ・ピリオド・ハイフンのみを含むトークンを「数値」とみなす
 const NUM_RE = /^[0-9][0-9,.\-]*$/;
 
+/**
+ * 全角の数字・カンマ・ピリオド・マイナスを半角に変換する。
+ * 一部のPDF作成ソフトは金額・数量を全角数字で出力するため、これを変換しないと
+ * NUM_RE に一致せず「数値」として認識できず、単価・金額が一切抽出できなくなる
+ * (項目名の一部として読み込まれてしまう)。英字・漢字部分には影響しない。
+ */
+function toHalfWidth(tok) {
+  return tok
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/，/g, ',')
+    .replace(/．/g, '.')
+    .replace(/－/g, '-');
+}
+
+/**
+ * カンマ区切りを含む数値文字列を number にパースする。パースできない場合は null。
+ */
+function parseLooseNumber(str) {
+  if (str === null || str === undefined) return null;
+  const cleaned = String(str).replace(/,/g, '').trim();
+  if (cleaned === '') return null;
+  const n = parseFloat(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
 // 同じ行とみなすy座標の許容誤差(pt)
 const ROW_Y_TOLERANCE = 3;
 
@@ -186,7 +211,7 @@ function extractWordsFromTextContent(textContent, rotationDeg) {
       if (!tok.trim()) continue;
 
       words.push({
-        text: tok,
+        text: toHalfWidth(tok),
         // 正規化座標系では、読む向きは常に+x方向になる
         x0: x0 + width * startFrac,
         x1: x0 + width * endFrac,
@@ -242,6 +267,7 @@ function parseRows(rows) {
     let qty = null;
     let unit = null;
     let unitPrice = null;
+    let unitPriceDerived = false;
     let amount = null;
 
     if (numIdx.length > 0) {
@@ -250,6 +276,19 @@ function parseRows(rows) {
       amount = nums[nums.length - 1];
       if (nums.length >= 3) {
         unitPrice = nums[nums.length - 2];
+      } else if (nums.length === 2) {
+        // 「数量」と「金額」の2つしか印字されておらず、単価が別の列として
+        // 明記されていない見積書も多い。この場合も 単価 = 金額 ÷ 数量 で
+        // 逆算できれば補完する(AIが単価チェックできる行を増やすため)。
+        const qtyNum = parseLooseNumber(qty);
+        const amountNum = parseLooseNumber(amount);
+        if (qtyNum && amountNum && qtyNum !== 0) {
+          const derived = amountNum / qtyNum;
+          if (Number.isFinite(derived) && derived > 0) {
+            unitPrice = String(Math.round(derived * 100) / 100);
+            unitPriceDerived = true;
+          }
+        }
       }
       const firstNumIdx = numIdx[0];
       const nextIsAlsoNumeric = numIdx.length >= 2 && firstNumIdx + 1 === numIdx[1];
@@ -267,6 +306,7 @@ function parseRows(rows) {
       qty,
       unit,
       unitPrice,
+      unitPriceDerived,
       amount,
       rightmostX1,
       yTop,
