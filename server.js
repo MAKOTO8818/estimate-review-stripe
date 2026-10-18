@@ -440,7 +440,9 @@ async function startEstimateReview({ tenant, lineUserId, pageCount }) {
     const { pages } = await extractStructuredPdf(pdfBuffer);
     // pool を渡すことで、過去の見積り実績(estimate_line_items)から単価統計を集計し、
     // 「学習型AI添削」としてAIの判断材料に組み込む(件数が少ないうちは自動的に使われない)。
-    const result = await reviewEstimate(pages, { pool });
+    // pdfBuffer も渡すことで、スキャナー取り込み/写真などテキスト情報を持たないページがあった場合に、
+    // そのページだけをClaudeの画像認識機能で直接読み取るフォールバックが使えるようにする。
+    const result = await reviewEstimate(pages, { pool, pdfBuffer });
     console.log('🤖 AI一次チェック完了:', {
       tenant: tenant.slug,
       lineUserId,
