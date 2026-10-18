@@ -39,11 +39,19 @@ const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」
 # 厳守事項
 - あなた自身が最終判断者ではありません。「専門家が確認すべき論点」を洗い出すのが仕事です。
 - 断定的な「これは不当請求です」等の表現は使わない。「相場と比べて高い可能性がある」等、根拠とセットで指摘する。
-- 単価に言及する場合、「本サービスの過去実績データに基づく単価統計」が提供されている項目については、
-  その実績データ(件数・平均・範囲)を根拠として明示し、今回の単価がその範囲内か、どの程度乖離しているかを具体的に述べること。
-  (例:「過去12件の実績平均は3,200円/m²ですが、本見積りは5,000円/m²で、実績平均より約56%高くなっています(本サービス実績データに基づく)」)
-- 上記の実績データが提供されていない項目については、あなたの学習知識に基づく一般的な相場観であることを明記し
-  (例:「一般的な相場は◯◯円/ m程度と思われます(AI推定・参考値)」)、リアルタイムの最新相場ではない可能性がある旨がわかるようにする。
+- 単価の妥当性は、以下の優先順位で根拠づけること:
+  1. 「本サービスの過去実績データに基づく単価統計」が提供されている項目は、最優先でそれを根拠にする。
+     件数・平均・範囲を明示し、今回の単価がその範囲内か、どの程度乖離しているかを具体的に述べること。
+     (例:「過去12件の実績平均は3,200円/m²ですが、本見積りは5,000円/m²で、実績平均より約56%高くなっています(本サービス実績データに基づく)」)
+  2. 過去実績データが無い項目で、金額が大きい・疑わしいなど重点的に確認すべきものについては、
+     web_search ツールを使って現在の一般的な相場・単価情報を調べてよい(無制限に使わず、必要な項目に絞ること)。
+     検索結果を根拠にする場合は、調べた情報源(サイト名)を明記すること。
+     (例:「〇〇(サイト名)によれば、現在の相場は◯◯円/m²程度とされており、本見積りはこれより高めです(web検索結果に基づく)」)
+  3. 上記のいずれも無い項目については、あなたの学習知識に基づく一般的な相場観であることを明記し
+     (例:「一般的な相場は◯◯円/ m程度と思われます(AI推定・参考値)」)、リアルタイムの最新相場ではない可能性がある旨がわかるようにする。
+- web_searchツールを使う場合でも、最終的な出力は必ず下記の「出力形式」通りのJSONのみとすること。
+  検索中の説明文(「検索します」等)を最終回答として出力してはいけない。検索が終わったら、
+  その結果を踏まえて改めてJSON形式の回答を生成すること。
 - 見積書に記載のない情報を推測で補わない。不明な点は「不明」「要確認」と明記する。
 - 個人や会社を誹謗中傷しない。あくまで見積書の記載内容に対する客観的な指摘に留める。
 - findings の "page" と "itemText" は、入力データに登場する値をそのまま(一字一句変えずに)使うこと。
@@ -256,6 +264,20 @@ async function reviewEstimate(structuredPages, context = {}) {
     .filter(Boolean)
     .join('\n');
 
+  // 過去実績データが無い項目について、現在の一般的な相場をweb検索で調べられるようにする。
+  // (1件のチェックあたり最大5回までに制限し、コストと処理時間が膨らみすぎないようにしている)
+  const tools = [
+    {
+      type: 'web_search_20250305',
+      name: 'web_search',
+      max_uses: 5,
+    },
+  ];
+  // web検索ツールを使う場合、Claudeが「検索します」という説明文 -> 検索実行 -> 検索結果を踏まえた
+  // 最終回答、という複数ターンのやり取りを1回のAPI呼び出し内で行う(stop_reasonが'pause_turn'の間は
+  // 続きがあるので、応答をそのまま履歴に積んで呼び出しを継続する)。
+  const MAX_SEARCH_ROUNDS = 5;
+
   // Anthropic APIが混雑時などに一時的に空応答を返すことがあるため、
   // テキストブロックが取得できなかった場合は1回だけ自動的に再試行する。
   const MAX_ATTEMPTS = 2;
@@ -264,14 +286,26 @@ async function reviewEstimate(structuredPages, context = {}) {
   let lastDiagnostics = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    response = await anthropic.messages.create({
-      model: 'claude-sonnet-5',
-      max_tokens: 8192,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMessage }],
-    });
+    const messages = [{ role: 'user', content: userMessage }];
 
-    textBlock = response.content.find((block) => block.type === 'text');
+    for (let round = 1; round <= MAX_SEARCH_ROUNDS; round++) {
+      response = await anthropic.messages.create({
+        model: 'claude-sonnet-5',
+        max_tokens: 8192,
+        system: SYSTEM_PROMPT,
+        messages,
+        tools,
+      });
+
+      if (response.stop_reason !== 'pause_turn') break;
+      // 検索の続きがある場合、直前の応答をそのまま履歴に積んで継続する
+      messages.push({ role: 'assistant', content: response.content });
+    }
+
+    // web検索を使った場合、「検索します」という説明文のあとに検索結果・最終回答の順で
+    // テキストブロックが並ぶことがあるため、最後のテキストブロックを最終回答として扱う。
+    const textBlocks = response.content.filter((block) => block.type === 'text');
+    textBlock = textBlocks.length > 0 ? textBlocks[textBlocks.length - 1] : null;
     if (textBlock) break;
 
     lastDiagnostics = {
