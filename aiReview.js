@@ -96,6 +96,10 @@ const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」
   この値は自動的にPDF上の該当箇所への注釈(マーカー)配置に使われるため、要約したり言い換えたりしないこと。
 - 各 "concern" "basis" "expertQuestion" はそれぞれ120文字程度までを目安に簡潔にまとめること
   (このページ単位でのチェックのため、件数の上限は設けない。該当する行の数だけ出力してよい)。
+- 【重要・JSON破損防止】"concern" "basis" "expertQuestion" などの文字列の中では、半角の二重引用符(")を
+  絶対に使わないこと。何かを引用・強調したい場合は、日本語の鍵括弧「」を使うこと(例: 「一式」という記載、
+  「仮設工事」の単価)。半角引用符をそのまま文中に書くと、出力全体がJSONとして壊れ、このページの
+  指摘が丸ごと失われる原因になる。
 
 # チェック観点(このページの行ごとに、1行ずつ確認すること)
 1. 単価の妥当性(一般的な相場との乖離) — 単価が明記されている行は全て、上記のweb_search方針に従って確認する
@@ -161,6 +165,9 @@ const SYSTEM_PROMPT_SCANNED = `あなたは「建設顧問セカンドオピニ�
   (この入力は画像のため、PDF上への自動マーキングには使われず、一覧表示にのみ使われます)。
 - 各 "concern" "basis" "expertQuestion" はそれぞれ120文字程度までを目安に簡潔にまとめること
   (件数の上限は設けない。該当する行の数だけ出力してよい)。
+- 【重要・JSON破損防止】"concern" "basis" "expertQuestion" などの文字列の中では、半角の二重引用符(")を
+  絶対に使わないこと。何かを引用・強調したい場合は、日本語の鍵括弧「」を使うこと。半角引用符を
+  そのまま文中に書くと、出力全体がJSONとして壊れ、このページの指摘が丸ごと失われる原因になる。
 
 # チェック観点(このページの行ごとに、1行ずつ確認すること)
 1. 単価の妥当性(一般的な相場との乖離) — 単価が明記されている行は全て、上記のweb_search方針に従って確認する
@@ -365,6 +372,70 @@ function repairTruncatedJson(rawJson) {
   }
 }
 
+/**
+ * JSON全体としては壊れている(例: 文字列の値の中にエスケープされていない " が
+ * そのまま入っていて、そこで文字列が早期に閉じたと誤認識されるなど)が、
+ * "findings" 配列の中には個々には正しい形のオブジェクトも混ざっている、という場合に、
+ * 壊れているオブジェクト「だけ」を読み飛ばし、正常なオブジェクトだけを救い出す。
+ * (1件のAI出力の軽微な崩れのせいで、そのページの指摘が全部ゼロ件になってしまう
+ *  ことを避けるための保険。findings以外(summary等)は救出しない=ベストエフォート)
+ * 救出できるオブジェクトが1件もなければ null を返す。
+ */
+function salvageFindings(rawJson) {
+  const keyIdx = rawJson.indexOf('"findings"');
+  if (keyIdx === -1) return null;
+  const arrStart = rawJson.indexOf('[', keyIdx);
+  if (arrStart === -1) return null;
+
+  const findings = [];
+  let i = arrStart + 1;
+
+  while (i < rawJson.length) {
+    while (i < rawJson.length && /[\s,]/.test(rawJson[i])) i++;
+    if (i >= rawJson.length || rawJson[i] === ']') break;
+    if (rawJson[i] !== '{') break; // 想定外の構造に当たったら、そこで打ち切る
+
+    let depth = 0;
+    let inStr = false;
+    let escape = false;
+    let j = i;
+    for (; j < rawJson.length; j++) {
+      const ch = rawJson[j];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = !inStr;
+        continue;
+      }
+      if (inStr) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          j++;
+          break;
+        }
+      }
+    }
+
+    const objStr = rawJson.slice(i, j);
+    try {
+      findings.push(JSON.parse(objStr));
+    } catch (err) {
+      // このオブジェクトだけ壊れているので読み飛ばす(他の正常なオブジェクトは救出を続ける)
+    }
+    i = j;
+  }
+
+  return findings.length > 0 ? { findings } : null;
+}
+
 // 1ページあたりのweb検索の上限(ページ単位でAIを呼ぶため、見積書全体で見れば
 // ページ数に比例して検索回数が増える)。単価が記載されている行は基本的に全て検索対象とする
 // 方針に変更したため、1ページに項目が多い場合でも足りるよう、やや余裕を持たせている。
@@ -485,7 +556,16 @@ async function reviewSinglePage(page, opts) {
         aiResult = repaired;
         wasTruncated = true;
       } else {
-        throw new Error(`${page.pageNumber}ページ目のAI応答のJSON解析に失敗しました: ${err.message}\n生の応答: ${textBlock.text}`);
+        const salvaged = salvageFindings(rawJson);
+        if (salvaged) {
+          console.warn(
+            `⚠️ [${page.pageNumber}ページ] AI応答のJSON全体は解析できませんでした(${err.message})が、個々のfindingsのうち解析できたものだけ救出して続行します(壊れていた分は欠落します)。`
+          );
+          aiResult = salvaged;
+          wasTruncated = true;
+        } else {
+          throw new Error(`${page.pageNumber}ページ目のAI応答のJSON解析に失敗しました: ${err.message}\n生の応答: ${textBlock.text}`);
+        }
       }
     }
   }
@@ -626,7 +706,16 @@ async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
         aiResult = repaired;
         wasTruncated = true;
       } else {
-        throw new Error(`${pageNumber}ページ目(画像)のAI応答のJSON解析に失敗しました: ${err.message}\n生の応答: ${textBlock.text}`);
+        const salvaged = salvageFindings(rawJson);
+        if (salvaged) {
+          console.warn(
+            `⚠️ [${pageNumber}ページ(画像)] AI応答のJSON全体は解析できませんでした(${err.message})が、個々のfindingsのうち解析できたものだけ救出して続行します。`
+          );
+          aiResult = salvaged;
+          wasTruncated = true;
+        } else {
+          throw new Error(`${pageNumber}ページ目(画像)のAI応答のJSON解析に失敗しました: ${err.message}\n生の応答: ${textBlock.text}`);
+        }
       }
     }
   }
