@@ -60,6 +60,15 @@ const PORT = process.env.PORT || 4242;
 // --- 公開LP(トップページ)の配信。/public/index.html が "/" でそのまま表示される ---
 app.use(express.static(path.join(__dirname, 'public')));
 
+// --- スリープ防止用のヘルスチェック(下の自己ping、および外部監視サービスから使う) ---
+// Renderの無料プランは「一定時間アクセスがない」とスリープし、次のリクエストが
+// 50秒以上待たされる(その間にLINEのWebhookがタイムアウトし、お客様への応答が
+// 届かなくなることがある)。これを避けるため、このエンドポイントに定期的に
+// アクセスし続けることで「アクセスがある状態」を保つ。
+app.get('/health', (req, res) => {
+  res.status(200).send('ok');
+});
+
 // 「一式」注意書き(お客様が利用前に必ず目にするよう、案内文・受付確認メッセージの両方に挿入する)
 const LUMP_SUM_WARNING =
   '【ご利用前の注意】内訳が「一式」とだけ記載され、数量・単価の内訳がない項目は、AIが金額の妥当性を判断できません。' +
@@ -416,7 +425,7 @@ async function startEstimateReview({ tenant, lineUserId, pageCount }) {
 
   try {
     const { pages } = await extractStructuredPdf(pdfBuffer);
-        // pool を渡すことで、過去の見積り実績(estimate_line_items)から単価統計を集計し、
+    // pool を渡すことで、過去の見積り実績(estimate_line_items)から単価統計を集計し、
     // 「学習型AI添削」としてAIの判断材料に組み込む(件数が少ないうちは自動的に使われない)。
     const result = await reviewEstimate(pages, { pool });
     console.log('🤖 AI一次チェック完了:', {
@@ -1308,6 +1317,22 @@ initDb()
     setInterval(() => {
       retryUnreportedTenantUsage().catch((err) => console.error('❌ 使用量の再送処理でエラー:', err));
     }, 10 * 60 * 1000);
+
+    // --- スリープ防止: 自分自身の公開URLに定期的にアクセスし、「アクセスがある状態」を保つ ---
+    // (サーバー内部のタイマーだけでは外部からのアクセスとみなされずスリープしてしまうため、
+    //  実際に自分のURLへHTTPリクエストを送ることで防止する)
+    const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000; // 10分おき(無料プランのスリープ閾値より十分短い間隔)
+    setInterval(() => {
+      fetch(`${BASE_URL}/health`)
+        .then((res) => {
+          if (!res.ok) {
+            console.warn(`⚠️ スリープ防止pingが異常なステータスを返しました: ${res.status}`);
+          }
+        })
+        .catch((err) => {
+          console.warn('⚠️ スリープ防止pingに失敗しました(次回また試みます):', err.message);
+        });
+    }, KEEP_ALIVE_INTERVAL_MS);
   })
   .catch((err) => {
     console.error('❌ DB初期化に失敗したため、サーバーを起動できません:', err);
