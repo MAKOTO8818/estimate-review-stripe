@@ -186,6 +186,19 @@ app.post(
           console.error(`⚠️ 決済完了Webhookのtenant_id(${tenant_id})に対応するテナントが見つかりません。`);
           return;
         }
+
+        // AI一次チェック(〜PDF添削)には数分かかることがあるため、お客様が「反応がない」と
+        // 不安にならないよう、決済完了を検知した時点ですぐにLINEで案内を送っておく。
+        try {
+          const lineClient = clientForTenant(tenant);
+          await lineClient.pushMessage(line_user_id, {
+            type: 'text',
+            text: 'お支払いが完了しました。ただいまAI一次チェックを行っております。完了まで数分ほどお時間をいただく場合がございます。少々お待ちください。',
+          });
+        } catch (err) {
+          console.error('⚠️ 決済完了案内メッセージの送信に失敗しました(処理は続行します):', err.message);
+        }
+
         await startEstimateReview({ tenant, lineUserId: line_user_id, pageCount: Number(page_count) });
       })().catch((err) => {
         console.error('❌ startEstimateReview(Webhook経由)でエラー:', err);
