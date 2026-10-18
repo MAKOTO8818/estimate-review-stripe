@@ -275,7 +275,23 @@ function parseRows(rows) {
 
   for (const row of rows) {
     const ws = row.words.slice().sort((a, b) => a.x0 - b.x0);
-    const texts = ws.map((w) => w.text);
+    let texts = ws.map((w) => w.text);
+
+    // 「NO」列(行の連番。1, 2, 3...)が項目名より左の独立した列として印字されている見積書が多い。
+    // この連番自体も単なる数字なのでNUM_REに一致してしまい、何もケアしないと
+    // 「先頭の数値トークンより前が項目名」という判定ロジックが、連番の時点で項目名を
+    // 空文字(0文字)にしてしまい、その行(=本物の工事項目)を丸ごと取りこぼす原因になっていた。
+    // 見分け方: 先頭トークンが整数の連番らしい(小数点・カンマなし)数値で、直後のトークンが
+    // 数値でない(=項目名が続く)、かつ行の他の場所にも数値(数量・単価・金額)が存在する場合だけ、
+    // 連番として読み飛ばす(単なる「数量だけの行」などを誤って壊さないよう、条件を絞っている)。
+    if (
+      texts.length >= 2 &&
+      /^[0-9]{1,4}$/.test(texts[0]) &&
+      !NUM_RE.test(texts[1]) &&
+      texts.slice(1).some((t) => NUM_RE.test(t))
+    ) {
+      texts = texts.slice(1);
+    }
 
     const numIdx = [];
     texts.forEach((t, i) => {
