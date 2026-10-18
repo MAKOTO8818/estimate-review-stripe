@@ -436,6 +436,100 @@ function salvageFindings(rawJson) {
   return findings.length > 0 ? { findings } : null;
 }
 
+/**
+ * プロンプトで「半角引用符を使うな」と指示しても、AIが稀に従わないことがある。
+ * その保険として、JSON文字列の値の「途中」に現れた半角引用符(本来の閉じ引用符ではないもの)を
+ * 自動的にエスケープ(\")してから解析し直す。
+ * 見分け方: 文字列の中で "" に出会ったとき、直後(空白を飛ばして)の文字が
+ * , } ] : のいずれか(=本来の閉じ引用符らしい)でなければ、文字列途中の引用符とみなして
+ * エスケープする。既に正しいJSONに対しては何もしない(無害)。
+ */
+function sanitizeStrayQuotes(text) {
+  let result = '';
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escape) {
+      result += ch;
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      result += ch;
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      if (!inString) {
+        inString = true;
+        result += ch;
+        continue;
+      }
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      const next = text[j];
+      const looksLikeClose = next === undefined || ',}]:'.includes(next);
+      if (looksLikeClose) {
+        inString = false;
+        result += ch;
+      } else {
+        result += '\\"';
+      }
+      continue;
+    }
+    result += ch;
+  }
+
+  return result;
+}
+
+/**
+ * AIのテキスト応答からJSONを取り出して解析する。半角引用符の混入による破損や、
+ * トークン上限による途中切れなど、ありがちな崩れ方に対して段階的に復旧を試みる。
+ * 最終的にどうしても解析できない場合だけ例外を投げる。
+ * @param {string} rawText AI応答のテキスト全体
+ * @param {string} pageLabel ログ表示用のページ識別文字列(例: "3ページ")
+ * @returns {{ aiResult: object, wasTruncated: boolean }}
+ */
+function parseAiJsonResponse(rawText, pageLabel) {
+  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+  const rawJson = jsonMatch ? jsonMatch[0] : rawText;
+
+  // 1. そのまま解析
+  try {
+    return { aiResult: JSON.parse(rawJson), wasTruncated: false };
+  } catch (errPlain) {
+    // 2. 文字列途中の半角引用符を自動エスケープしてから解析
+    try {
+      const sanitized = sanitizeStrayQuotes(rawJson);
+      const result = JSON.parse(sanitized);
+      console.warn(`⚠️ [${pageLabel}] AI応答中の半角引用符の混入を自動修復して解析しました。`);
+      return { aiResult: result, wasTruncated: false };
+    } catch (errSanitized) {
+      // 3. トークン上限等による途中切れを修復(素のrawJson・サニタイズ後の両方で試す)
+      const repaired = repairTruncatedJson(rawJson) || repairTruncatedJson(sanitizeStrayQuotes(rawJson));
+      if (repaired) {
+        console.warn(`⚠️ [${pageLabel}] AI応答の一部が途中で切れていたため、自動修復して処理を続行しました(検出できた範囲の指摘のみ反映されます)。`);
+        return { aiResult: repaired, wasTruncated: true };
+      }
+
+      // 4. 個々のfindingsオブジェクトのうち、解析できたものだけ救出(素・サニタイズ後の両方で試す)
+      const salvaged = salvageFindings(rawJson) || salvageFindings(sanitizeStrayQuotes(rawJson));
+      if (salvaged) {
+        console.warn(
+          `⚠️ [${pageLabel}] AI応答のJSON全体は解析できませんでした(${errPlain.message})が、個々のfindingsのうち解析できたものだけ救出して続行します(壊れていた分は欠落します)。`
+        );
+        return { aiResult: salvaged, wasTruncated: true };
+      }
+
+      throw new Error(`${pageLabel}のAI応答のJSON解析に失敗しました: ${errPlain.message}\n生の応答: ${rawText}`);
+    }
+  }
+}
+
 // 1ページあたりのweb検索の上限(ページ単位でAIを呼ぶため、見積書全体で見れば
 // ページ数に比例して検索回数が増える)。単価が記載されている行は基本的に全て検索対象とする
 // 方針に変更したため、1ページに項目が多い場合でも足りるよう、やや余裕を持たせている。
@@ -540,35 +634,7 @@ async function reviewSinglePage(page, opts) {
     );
   }
 
-  let aiResult;
-  let wasTruncated = false;
-  {
-    const jsonMatch = textBlock.text.match(/\{[\s\S]*\}/);
-    const rawJson = jsonMatch ? jsonMatch[0] : textBlock.text;
-    try {
-      aiResult = JSON.parse(rawJson);
-    } catch (err) {
-      const repaired = repairTruncatedJson(rawJson);
-      if (repaired) {
-        console.warn(
-          `⚠️ [${page.pageNumber}ページ] AI応答の一部が途中で切れていたため、自動修復して処理を続行しました(検出できた範囲の指摘のみ反映されます)。`
-        );
-        aiResult = repaired;
-        wasTruncated = true;
-      } else {
-        const salvaged = salvageFindings(rawJson);
-        if (salvaged) {
-          console.warn(
-            `⚠️ [${page.pageNumber}ページ] AI応答のJSON全体は解析できませんでした(${err.message})が、個々のfindingsのうち解析できたものだけ救出して続行します(壊れていた分は欠落します)。`
-          );
-          aiResult = salvaged;
-          wasTruncated = true;
-        } else {
-          throw new Error(`${page.pageNumber}ページ目のAI応答のJSON解析に失敗しました: ${err.message}\n生の応答: ${textBlock.text}`);
-        }
-      }
-    }
-  }
+  const { aiResult, wasTruncated } = parseAiJsonResponse(textBlock.text, `${page.pageNumber}ページ`);
 
   const findings = (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai' }));
 
@@ -690,35 +756,7 @@ async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
     );
   }
 
-  let aiResult;
-  let wasTruncated = false;
-  {
-    const jsonMatch = textBlock.text.match(/\{[\s\S]*\}/);
-    const rawJson = jsonMatch ? jsonMatch[0] : textBlock.text;
-    try {
-      aiResult = JSON.parse(rawJson);
-    } catch (err) {
-      const repaired = repairTruncatedJson(rawJson);
-      if (repaired) {
-        console.warn(
-          `⚠️ [${pageNumber}ページ(画像)] AI応答の一部が途中で切れていたため、自動修復して処理を続行しました。`
-        );
-        aiResult = repaired;
-        wasTruncated = true;
-      } else {
-        const salvaged = salvageFindings(rawJson);
-        if (salvaged) {
-          console.warn(
-            `⚠️ [${pageNumber}ページ(画像)] AI応答のJSON全体は解析できませんでした(${err.message})が、個々のfindingsのうち解析できたものだけ救出して続行します。`
-          );
-          aiResult = salvaged;
-          wasTruncated = true;
-        } else {
-          throw new Error(`${pageNumber}ページ目(画像)のAI応答のJSON解析に失敗しました: ${err.message}\n生の応答: ${textBlock.text}`);
-        }
-      }
-    }
-  }
+  const { aiResult, wasTruncated } = parseAiJsonResponse(textBlock.text, `${pageNumber}ページ(画像)`);
 
   const findings = (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai-vision' }));
 
