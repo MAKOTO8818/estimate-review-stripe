@@ -609,6 +609,30 @@ async function reviewSinglePage(page, opts) {
       messages.push({ role: 'assistant', content: response.content });
     }
 
+    if (response.stop_reason === 'pause_turn') {
+      // 検索ラウンドの上限(MAX_SEARCH_ROUNDS_PER_PAGE)に達しても、AIがまだ検索を続けたがっている状態。
+      // ここで何もせず打ち切ると、response.content の最後が「〜を調査します。」のような
+      // 検索の予告文だけになり、それを最終回答として誤って扱ってしまう(=JSON解析に失敗する)。
+      // そこで、ツールを使わせない追加の呼び出しを1回だけ行い、ここまでの調査結果だけで
+      // 必ず最終的なJSON回答を締めくくらせる。
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({
+        role: 'user',
+        content:
+          'このページの検索回数の上限に達しました。追加の検索はせず、ここまでに判明している情報だけを使って、' +
+          '今すぐ「出力形式」通りのJSON回答のみを出力してください。まだ検索できていない項目があれば、' +
+          'basis に「web検索の上限に達したため、学習知識に基づく一般的な相場観」である旨を明記してください。',
+      });
+      response = await anthropic.messages.create({
+        model: 'claude-sonnet-5',
+        max_tokens: 16000,
+        system: SYSTEM_PROMPT,
+        messages,
+        tools,
+        tool_choice: { type: 'none' },
+      });
+    }
+
     // web検索を使った場合、「検索します」という説明文のあとに検索結果・最終回答の順で
     // テキストブロックが並ぶことがあるため、最後のテキストブロックを最終回答として扱う。
     const textBlocks = response.content.filter((block) => block.type === 'text');
@@ -731,6 +755,28 @@ async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
 
       if (response.stop_reason !== 'pause_turn') break;
       messages.push({ role: 'assistant', content: response.content });
+    }
+
+    if (response.stop_reason === 'pause_turn') {
+      // 検索ラウンドの上限に達してもAIがまだ検索を続けたがっている状態。ここで打ち切ると
+      // 「〜を調査します。」のような予告文だけが最終回答として扱われてしまうため、
+      // ツールを使わせない呼び出しを1回追加し、ここまでの情報だけでJSON回答を締めくくらせる。
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({
+        role: 'user',
+        content:
+          'このページの検索回数の上限に達しました。追加の検索はせず、ここまでに判明している情報だけを使って、' +
+          '今すぐ「出力形式」通りのJSON回答のみを出力してください。まだ検索できていない項目があれば、' +
+          'basis に「web検索の上限に達したため、学習知識に基づく一般的な相場観」である旨を明記してください。',
+      });
+      response = await anthropic.messages.create({
+        model: 'claude-sonnet-5',
+        max_tokens: 16000,
+        system: SYSTEM_PROMPT_SCANNED,
+        messages,
+        tools,
+        tool_choice: { type: 'none' },
+      });
     }
 
     const textBlocks = response.content.filter((block) => block.type === 'text');
