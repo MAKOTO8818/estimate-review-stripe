@@ -78,11 +78,19 @@ async function extractStructuredPdf(pdfBuffer) {
     const rows = groupWordsIntoRows(words);
     const parsedRows = parseRows(rows);
 
+    // スキャナーで読み込んだ/写真を貼り付けただけの「画像のみのPDF」は、
+    // ページ自体にテキスト情報が一切含まれていない(textContent.items が空)。
+    // この場合は行の抽出を試みても何も取れないため、呼び出し側(aiReview.js)で
+    // 「このページは画像としてAIの画像認識機能に読ませる」フォールバック処理に
+    // 切り替えるための目印として hasTextLayer を持たせる。
+    const hasTextLayer = textContent.items.some((item) => item.str && item.str.trim());
+
     pages.push({
       pageNumber: pageNum,
       width: viewport.width,
       height: viewport.height,
       rotationDeg, // pdfAnnotate.js側で、正規化座標を実際のページ座標に戻すために使う
+      hasTextLayer,
       rows: parsedRows,
     });
 
