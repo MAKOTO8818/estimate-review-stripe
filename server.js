@@ -1195,6 +1195,19 @@ app.get('/admin/tenants', async (req, res) => {
   `);
 });
 
+// --- 調査用: stripe_customersテーブルの中身をそのまま確認する(カード保存不具合の調査のため一時的に追加) ---
+app.get('/admin/debug/stripe-customers', async (req, res) => {
+  if (!requireAdminSecret(req, res)) return;
+  const { rows } = await pool.query(
+    `SELECT tenant_id, line_user_id, stripe_customer_id, created_at
+     FROM stripe_customers
+     ORDER BY created_at DESC
+     LIMIT 50`
+  );
+  const tenantsResult = await pool.query(`SELECT id, slug, created_at FROM tenants ORDER BY created_at ASC`);
+  res.json({ stripeCustomers: rows, tenants: tenantsResult.rows });
+});
+
 // --- 月次レポート用のJSON API(スケジュールタスクが毎月取得し、考察つきレポートを作る想定) ---
 app.get('/admin/report.json', async (req, res) => {
   if (!requireAdminSecret(req, res)) return;
