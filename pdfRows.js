@@ -34,6 +34,18 @@ function toHalfWidth(tok) {
     // 金額の列がまるごと読み取れなくなる。実際のPDFでかなりの頻度で発生していた)
 }
 
+// 「小計」「合計」「消費税」「見積№」など、工事の項目(行)ではなく集計・書類情報の行を見分ける。
+// これらは項目名のあとに数字が1つだけ(小計・合計額など)続くことが多く、そのまま行として
+// 扱うと「数量=金額」のような不自然な値になり、AIがそれを"データの誤り"として指摘する
+// ノイズの元になっていた(本来チェックすべき工事項目の指摘が埋もれてしまう)。
+const STRUCTURAL_ITEM_RE = /^(小計|合計|消費税|値引|税込|税別|NET|見積金額|御見積金額|見積№|見積番号|№|Ｎｏ|No\.?|ＮＯ)/;
+
+function isStructuralRow(itemText) {
+  const t = String(itemText || '').trim();
+  if (!t) return true;
+  return STRUCTURAL_ITEM_RE.test(t);
+}
+
 /**
  * カンマ区切りを含む数値文字列を number にパースする。パースできない場合は null。
  */
@@ -76,7 +88,7 @@ async function extractStructuredPdf(pdfBuffer) {
 
     const words = extractWordsFromTextContent(textContent, rotationDeg);
     const rows = groupWordsIntoRows(words);
-    const parsedRows = parseRows(rows);
+    const parsedRows = parseRows(rows).filter((r) => !isStructuralRow(r.item));
 
     // スキャナーで読み込んだ/写真を貼り付けただけの「画像のみのPDF」は、
     // ページ自体にテキスト情報が一切含まれていない(textContent.items が空)。
