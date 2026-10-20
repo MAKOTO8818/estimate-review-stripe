@@ -42,11 +42,6 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// [診断用] このファイルが読み込まれた時点でRenderログに1行出す。
-// 「貼り替え後のコードが実際にデプロイされて動いているか」を、見積書をテストしなくても
-// デプロイ直後のログだけで確認できるようにするための目印(ビルドごとに内容を変える必要はない)。
-console.error('[診断] aiReview.js 読み込み: 単価の全項目チェック必須版(web検索15回/ページ, max_tokens16000) 起動');
-
 const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」のAI一次チェック担当です。
 建築・リフォーム工事の見積書を、ページ単位で精査し、専門家(人間)が最終確認しやすい形に整理することが役割です。
 
@@ -487,6 +482,50 @@ function sanitizeStrayQuotes(text) {
 }
 
 /**
+ * テキストの中から、最初の "{" に対応する閉じ "}" までを正しく取り出す。
+ * 以前は /\{[\s\S]*\}/ という正規表現(最初の{から「最後に出てくる}」まで)を使っていたが、
+ * AIの応答にJSON本体の後ろに余計な説明文が続き、その説明文の中にたまたま "}" という
+ * 文字が含まれるケースで、本来のJSONの終わりより後ろまで誤って取り込んでしまい、
+ * 「Unexpected non-whitespace character after JSON」で解析が丸ごと失敗することがあった。
+ * この関数は文字列・エスケープを考慮しながら中括弧の対応を数えるので、
+ * 本来のJSONオブジェクトの終わりを正確に見つけられる。
+ */
+function extractFirstJsonObject(text) {
+  const start = text.indexOf('{');
+  if (start === -1) return text;
+
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = !inStr;
+      continue;
+    }
+    if (inStr) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+
+  // 閉じ切れなかった(トークン上限等による途中切れ)場合は、そのまま返して
+  // 後続のrepairTruncatedJson/salvageFindingsに処理を委ねる。
+  return text.slice(start);
+}
+
+/**
  * AIのテキスト応答からJSONを取り出して解析する。半角引用符の混入による破損や、
  * トークン上限による途中切れなど、ありがちな崩れ方に対して段階的に復旧を試みる。
  * 最終的にどうしても解析できない場合だけ例外を投げる。
@@ -495,8 +534,7 @@ function sanitizeStrayQuotes(text) {
  * @returns {{ aiResult: object, wasTruncated: boolean }}
  */
 function parseAiJsonResponse(rawText, pageLabel) {
-  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-  const rawJson = jsonMatch ? jsonMatch[0] : rawText;
+  const rawJson = extractFirstJsonObject(rawText);
 
   // 1. そのまま解析
   try {
@@ -549,6 +587,16 @@ const MAX_ATTEMPTS_PER_PAGE = 2;
 // 速度よりも「落ちずに最後まで終わる」ことを優先し、1ページずつ順番に処理する。
 const PAGE_CONCURRENCY = 1;
 
+// [診断用] このファイルが読み込まれた時点でRenderログに1行出す。
+// 「貼り替え後のコードが実際にデプロイされて動いているか」を、見積書をテストしなくても
+// デプロイ直後のログだけで確認できるようにするための目印。
+// (上記の定数より後ろで呼び出すこと。前に書くと、定数の初期化前にアクセスすることになり
+//  ReferenceErrorでサーバー全体が起動できなくなる事故が実際に一度起きた)
+console.error(
+  `[診断] aiReview.js 読み込み: 単価の全項目チェック必須版 起動(web検索${WEB_SEARCH_MAX_USES_PER_PAGE}回/ページ, ` +
+    `同時処理${PAGE_CONCURRENCY}ページ, max_tokens16000)`
+);
+
 /**
  * 1ページ分をAIでチェックする。
  * @param {PageData} page pdfRows.jsの1ページ分
@@ -559,6 +607,11 @@ const PAGE_CONCURRENCY = 1;
  */
 async function reviewSinglePage(page, opts) {
   const { workType, allStats } = opts;
+
+  // [診断用] ページの処理が「終わった後」だけでなく「始まった瞬間」にもログを出す。
+  // 1ページの処理(検索を含む)に数分かかることがあり、終了後のログしか無いと、
+  // 処理中なのか止まっているのか外から区別できないため。
+  console.error(`[診断] ${page.pageNumber}ページ(文字): 処理開始(行数=${(page.rows || []).length})`);
 
   const structuredText = buildStructuredTextForPage(page);
 
@@ -709,6 +762,8 @@ async function extractSinglePagePdfBuffer(pdfBuffer, pageNumber) {
  */
 async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
   const { workType } = opts;
+
+  console.error(`[診断] ${pageNumber}ページ(画像): 処理開始`);
 
   const pageBuffer = await extractSinglePagePdfBuffer(pdfBuffer, pageNumber);
   const base64 = pageBuffer.toString('base64');
@@ -890,15 +945,46 @@ async function reviewEstimate(structuredPages, context = {}) {
     );
   }
 
-  const textPageResults = await runWithConcurrencyLimit(pagesToReview, PAGE_CONCURRENCY, (page) =>
-    reviewSinglePage(page, { workType: context.workType, allStats })
-  );
+  // 1ページの処理に失敗しても(AI応答のJSON解析がどうしても成功しない等)、
+  // 見積書全体の添削を丸ごと失敗させない。そのページだけ「AIチェック未実施」として
+  // 空の結果を返し、他のページの指摘(とそこまでにかかった時間・決済)を無駄にしないようにする。
+  async function reviewSinglePageSafe(page) {
+    try {
+      return await reviewSinglePage(page, { workType: context.workType, allStats });
+    } catch (err) {
+      console.error(`❌ [${page.pageNumber}ページ] AIチェックに失敗したため、このページはスキップします:`, err.message);
+      return {
+        pageNumber: page.pageNumber,
+        summary: `(${page.pageNumber}ページ目はAIチェックに失敗したため、自動チェックできませんでした。原本を直接ご確認ください)`,
+        findings: [],
+        unclearItems: [`${page.pageNumber}ページ目: AIチェックに失敗したため未確認`],
+        expertChecklist: [],
+        truncated: true,
+      };
+    }
+  }
+
+  async function reviewSingleScannedPageSafe(page) {
+    try {
+      return await reviewSingleScannedPage(context.pdfBuffer, page.pageNumber, { workType: context.workType });
+    } catch (err) {
+      console.error(`❌ [${page.pageNumber}ページ(画像)] AIチェックに失敗したため、このページはスキップします:`, err.message);
+      return {
+        pageNumber: page.pageNumber,
+        summary: `(${page.pageNumber}ページ目(画像)はAIチェックに失敗したため、自動チェックできませんでした。原本を直接ご確認ください)`,
+        findings: [],
+        unclearItems: [`${page.pageNumber}ページ目: AIチェックに失敗したため未確認`],
+        expertChecklist: [],
+        truncated: true,
+      };
+    }
+  }
+
+  const textPageResults = await runWithConcurrencyLimit(pagesToReview, PAGE_CONCURRENCY, reviewSinglePageSafe);
 
   const scannedPageResults =
     scannedPages.length > 0 && context.pdfBuffer
-      ? await runWithConcurrencyLimit(scannedPages, PAGE_CONCURRENCY, (page) =>
-          reviewSingleScannedPage(context.pdfBuffer, page.pageNumber, { workType: context.workType })
-        )
+      ? await runWithConcurrencyLimit(scannedPages, PAGE_CONCURRENCY, reviewSingleScannedPageSafe)
       : [];
 
   const pageResults = [...textPageResults, ...scannedPageResults].sort((a, b) => a.pageNumber - b.pageNumber);
