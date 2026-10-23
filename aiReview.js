@@ -114,13 +114,16 @@ const SYSTEM_PROMPT = `あなたは「建設顧問セカンドオピニオン」
       "itemText": "入力データの項目名と完全一致する文字列",
       "concern": "指摘内容",
       "basis": "指摘の根拠(相場観・一般的な計算方法など)",
-      "severity": "high" | "medium" | "low",
+      "severity": "medium",
       "expertQuestion": "専門家が施主に確認すべき質問文"
     }
   ],
   "unclearItems": ["記載や抽出が不明瞭で判断できなかった項目"],
   "expertChecklist": ["最終確認者が特に見るべきポイントを箇条書きで"]
-}`;
+}
+※ "severity" には "high"(重要)・"medium"(確認推奨)・"low"(参考)のうち、どれか1つだけを文字列で書くこと
+  (上の例の "medium" はあくまで一例。複数の値を | でつないで書かないこと)。
+※ "page" には数値(例: 4)を書くこと。文字列の値の中で改行しないこと。`;
 
 // 画像のみのPDFページ(スキャン・写真)用のシステムプロンプト。基本方針はSYSTEM_PROMPTと同じだが、
 // 「構造化データ」ではなく「ページの画像そのもの」を読み取る前提で指示を書き換えている。
@@ -181,13 +184,16 @@ const SYSTEM_PROMPT_SCANNED = `あなたは「建設顧問セカンドオピニ�
       "itemText": "画像から読み取った項目名",
       "concern": "指摘内容",
       "basis": "指摘の根拠(相場観・一般的な計算方法など)",
-      "severity": "high" | "medium" | "low",
+      "severity": "medium",
       "expertQuestion": "専門家が施主に確認すべき質問文"
     }
   ],
   "unclearItems": ["記載や読み取りが不明瞭で判断できなかった項目"],
   "expertChecklist": ["最終確認者が特に見るべきポイントを箇条書きで"]
-}`;
+}
+※ "severity" には "high"(重要)・"medium"(確認推奨)・"low"(参考)のうち、どれか1つだけを文字列で書くこと
+  (上の例の "medium" はあくまで一例。複数の値を | でつないで書かないこと)。
+※ "page" には数値(例: 4)を書くこと。文字列の値の中で改行しないこと。`;
 
 /**
  * 数値文字列(カンマ区切り含む)をパースする。パースできない場合は null。
@@ -475,10 +481,139 @@ function sanitizeStrayQuotes(text) {
       }
       continue;
     }
-    result += ch;
+    result += inString ? escapeControlChar(ch) : ch;
   }
 
   return result;
+}
+
+/**
+ * 制御文字(改行・タブなど、U+0000〜U+001F)を、JSONの文字列の中で使える形(\n 等)に変換する。
+ * 制御文字でなければそのまま返す。
+ */
+function escapeControlChar(ch) {
+  const code = ch.charCodeAt(0);
+  if (code >= 0x20) return ch;
+  if (ch === '\n') return '\\n';
+  if (ch === '\r') return '\\r';
+  if (ch === '\t') return '\\t';
+  return `\\u${code.toString(16).padStart(4, '0')}`;
+}
+
+/**
+ * AIが "concern" などの文字列の値の中で、そのまま改行(やタブ)を入れてしまうことがある。
+ * JSONの仕様では文字列の中に生の改行を書けないため、JSON.parse が
+ * 「Bad control character in string literal」で失敗し、そのページの指摘が丸ごと失われていた。
+ * そこで、文字列の「中」にある制御文字だけを \n などに変換する
+ * (文字列の外の改行=JSONの見た目上の改行はそのまま残す)。既に正しいJSONに対しては何もしない(無害)。
+ */
+function escapeControlCharsInStrings(text) {
+  let result = '';
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) {
+      result += ch;
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      result += ch;
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      result += ch;
+      continue;
+    }
+    result += inString ? escapeControlChar(ch) : ch;
+  }
+
+  return result;
+}
+
+/**
+ * 以前のプロンプトの出力例に "severity": "high" | "medium" | "low" という(JSONとしては不正な)
+ * 書き方があり、AIがそれをそのまま真似して出力してしまうことがあった。
+ * プロンプトは直したが、念のため、この形が来た場合は「確認推奨(medium)」に置き換えて読み込めるようにする
+ * (AIが重要度を決めていない状態なので、高すぎも低すぎもしない medium を採用する)。
+ * @returns {{ text: string, fixed: boolean }}
+ */
+function fixSeverityAlternatives(text) {
+  let fixed = false;
+  const result = text.replace(/("severity"\s*:\s*)"[A-Za-z]*"(?:\s*\|\s*"[A-Za-z]*")+/g, (_, prefix) => {
+    fixed = true;
+    return `${prefix}"medium"`;
+  });
+  return { text: result, fixed };
+}
+
+/**
+ * AI応答(response.content)から、最終回答のテキストを取り出す。
+ * web検索を使うと、最終回答のテキストは「引用(citations)」の位置ごとに複数のテキストブロックに
+ * 分割されて返ってくる(JSONの途中でも分割される)。以前は「最後のテキストブロック」だけを
+ * 最終回答として扱っていたため、JSONの後半の断片しか読めず、指摘が0件になったり解析に失敗したりしていた。
+ * そこで、「最後の検索(ツール使用・検索結果)ブロックより後ろ」にあるテキストブロックを全てつなげる
+ * (それより前のテキストは「〜を検索します」といった途中経過の説明文なので含めない)。
+ * @param {Array} content Anthropic APIの response.content
+ * @returns {string}
+ */
+function collectFinalAnswerText(content) {
+  const blocks = Array.isArray(content) ? content : [];
+  let lastToolBlockIdx = -1;
+  blocks.forEach((block, i) => {
+    if (/(tool_use|tool_result)$/.test(block.type || '')) lastToolBlockIdx = i;
+  });
+  return blocks
+    .slice(lastToolBlockIdx + 1)
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text || '')
+    .join('');
+}
+
+/**
+ * ページ番号を数値にそろえる。AIが "4" や "4ページ" のように文字列で返すことがあり、
+ * そのままだとPDFへの注釈配置(pdfAnnotate.js)や、機械チェックとの重複除去で
+ * 「同じページ」と判定されなかった。読み取れない場合は、今チェックしているページの番号を使う。
+ */
+function toPageNumber(value, fallbackPageNumber) {
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value;
+  const match = String(value ?? '').match(/[0-9０-９]+/);
+  if (match) {
+    const n = parseInt(match[0].replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0)), 10);
+    if (n > 0) return n;
+  }
+  return fallbackPageNumber;
+}
+
+/**
+ * 解析できたAIの回答を、後続処理が想定する形にそろえる。
+ *   - findings が配列でなければ空の配列として扱う(配列の中のオブジェクト以外の要素も除外する)
+ *   - 各 finding の page を数値にそろえる
+ *   - summary / unclearItems / expertChecklist も型をそろえる
+ * @param {any} aiResult JSON.parse の結果
+ * @param {number} pageNumber 今チェックしているページの番号
+ * @param {string} pageLabel ログ表示用のページ識別文字列
+ */
+function normalizeAiResult(aiResult, pageNumber, pageLabel) {
+  const obj = aiResult && typeof aiResult === 'object' && !Array.isArray(aiResult) ? aiResult : {};
+
+  if (obj.findings !== undefined && !Array.isArray(obj.findings)) {
+    console.warn(`⚠️ [${pageLabel}] AI応答の findings が配列ではなかったため、空の配列として扱います(型: ${typeof obj.findings})。`);
+  }
+  const findings = (Array.isArray(obj.findings) ? obj.findings : [])
+    .filter((f) => f && typeof f === 'object' && !Array.isArray(f))
+    .map((f) => ({ ...f, page: toPageNumber(f.page, pageNumber) }));
+
+  return {
+    summary: typeof obj.summary === 'string' ? obj.summary : '',
+    findings,
+    unclearItems: Array.isArray(obj.unclearItems) ? obj.unclearItems : [],
+    expertChecklist: Array.isArray(obj.expertChecklist) ? obj.expertChecklist : [],
+  };
 }
 
 /**
@@ -526,46 +661,59 @@ function extractFirstJsonObject(text) {
 }
 
 /**
- * AIのテキスト応答からJSONを取り出して解析する。半角引用符の混入による破損や、
+ * AIのテキスト応答からJSONを取り出して解析する。半角引用符の混入・文字列中の改行による破損や、
  * トークン上限による途中切れなど、ありがちな崩れ方に対して段階的に復旧を試みる。
  * 最終的にどうしても解析できない場合だけ例外を投げる。
- * @param {string} rawText AI応答のテキスト全体
+ * @param {string} rawText AI応答のテキスト全体(collectFinalAnswerTextでつなげたもの)
  * @param {string} pageLabel ログ表示用のページ識別文字列(例: "3ページ")
  * @returns {{ aiResult: object, wasTruncated: boolean }}
  */
 function parseAiJsonResponse(rawText, pageLabel) {
-  const rawJson = extractFirstJsonObject(rawText);
+  const { text: rawJson, fixed: severityFixed } = fixSeverityAlternatives(extractFirstJsonObject(rawText));
+  if (severityFixed) {
+    console.warn(`⚠️ [${pageLabel}] AI応答に "high" | "medium" のような不正な severity があったため、"medium" に置き換えて解析します。`);
+  }
 
-  // 1. そのまま解析
-  try {
-    return { aiResult: JSON.parse(rawJson), wasTruncated: false };
-  } catch (errPlain) {
-    // 2. 文字列途中の半角引用符を自動エスケープしてから解析
+  // 素のまま → 文字列中の制御文字だけ直したもの → 半角引用符の混入も直したもの、の順に試す
+  const candidates = [
+    { text: rawJson, fixLabel: null },
+    { text: escapeControlCharsInStrings(rawJson), fixLabel: '文字列中の改行・制御文字' },
+    { text: sanitizeStrayQuotes(rawJson), fixLabel: '半角引用符の混入(と文字列中の改行・制御文字)' },
+  ];
+
+  // 1. そのまま(または上記の修復をしてから)解析
+  let firstError = null;
+  for (const { text, fixLabel } of candidates) {
     try {
-      const sanitized = sanitizeStrayQuotes(rawJson);
-      const result = JSON.parse(sanitized);
-      console.warn(`⚠️ [${pageLabel}] AI応答中の半角引用符の混入を自動修復して解析しました。`);
+      const result = JSON.parse(text);
+      if (fixLabel) console.warn(`⚠️ [${pageLabel}] AI応答中の${fixLabel}を自動修復して解析しました。`);
       return { aiResult: result, wasTruncated: false };
-    } catch (errSanitized) {
-      // 3. トークン上限等による途中切れを修復(素のrawJson・サニタイズ後の両方で試す)
-      const repaired = repairTruncatedJson(rawJson) || repairTruncatedJson(sanitizeStrayQuotes(rawJson));
-      if (repaired) {
-        console.warn(`⚠️ [${pageLabel}] AI応答の一部が途中で切れていたため、自動修復して処理を続行しました(検出できた範囲の指摘のみ反映されます)。`);
-        return { aiResult: repaired, wasTruncated: true };
-      }
-
-      // 4. 個々のfindingsオブジェクトのうち、解析できたものだけ救出(素・サニタイズ後の両方で試す)
-      const salvaged = salvageFindings(rawJson) || salvageFindings(sanitizeStrayQuotes(rawJson));
-      if (salvaged) {
-        console.warn(
-          `⚠️ [${pageLabel}] AI応答のJSON全体は解析できませんでした(${errPlain.message})が、個々のfindingsのうち解析できたものだけ救出して続行します(壊れていた分は欠落します)。`
-        );
-        return { aiResult: salvaged, wasTruncated: true };
-      }
-
-      throw new Error(`${pageLabel}のAI応答のJSON解析に失敗しました: ${errPlain.message}\n生の応答: ${rawText}`);
+    } catch (err) {
+      if (!firstError) firstError = err;
     }
   }
+
+  // 2. トークン上限等による途中切れを修復
+  for (const { text } of candidates) {
+    const repaired = repairTruncatedJson(text);
+    if (repaired) {
+      console.warn(`⚠️ [${pageLabel}] AI応答の一部が途中で切れていたため、自動修復して処理を続行しました(検出できた範囲の指摘のみ反映されます)。`);
+      return { aiResult: repaired, wasTruncated: true };
+    }
+  }
+
+  // 3. 個々のfindingsオブジェクトのうち、解析できたものだけ救出
+  for (const { text } of candidates) {
+    const salvaged = salvageFindings(text);
+    if (salvaged) {
+      console.warn(
+        `⚠️ [${pageLabel}] AI応答のJSON全体は解析できませんでした(${firstError.message})が、個々のfindingsのうち解析できたものだけ救出して続行します(壊れていた分は欠落します)。`
+      );
+      return { aiResult: salvaged, wasTruncated: true };
+    }
+  }
+
+  throw new Error(`${pageLabel}のAI応答のJSON解析に失敗しました: ${firstError.message}\n生の応答: ${rawText}`);
 }
 
 // 1ページあたりのweb検索の上限。
@@ -593,47 +741,42 @@ const PAGE_CONCURRENCY = 1;
 // (上記の定数より後ろで呼び出すこと。前に書くと、定数の初期化前にアクセスすることになり
 //  ReferenceErrorでサーバー全体が起動できなくなる事故が実際に一度起きた)
 console.error(
-  `[診断] aiReview.js 読み込み: 単価の全項目チェック必須版 起動(web検索${WEB_SEARCH_MAX_USES_PER_PAGE}回/ページ, ` +
+  `[診断] aiReview.js 読み込み: 単価の全項目チェック必須版・JSON読み込み修正版 起動(web検索${WEB_SEARCH_MAX_USES_PER_PAGE}回/ページ, ` +
     `同時処理${PAGE_CONCURRENCY}ページ, max_tokens16000)`
 );
 
+// max_tokens(出力の上限)で回答が途中で切れた場合に、やり直しの呼び出しに付け加える指示。
+const MAX_TOKENS_RETRY_HINT =
+  '【再実行のお願い】前回の回答は出力の上限に達して途中で切れてしまいました。' +
+  'チェック対象の行は省略せず、各findingsの "concern" "basis" "expertQuestion" をそれぞれ60文字程度に短くまとめて、' +
+  'JSONを必ず最後の閉じ括弧まで出力してください。';
+
 /**
- * 1ページ分をAIでチェックする。
- * @param {PageData} page pdfRows.jsの1ページ分
- * @param {object} opts
- * @param {string} [opts.workType]
- * @param {Array} opts.allStats fetchPriceStatsGroupedByItemの結果(全項目分。ページ内の項目にマッチするものだけ絞り込んで使う)
- * @returns {Promise<{pageNumber: number, summary: string, findings: Array, unclearItems: Array, expertChecklist: Array, truncated: boolean}>}
+ * 最初のユーザーメッセージに、max_tokensでのやり直し用の指示を付け加える。
+ * (文字ページは文字列、画像ページはブロックの配列なので、両方に対応する)
  */
-async function reviewSinglePage(page, opts) {
-  const { workType, allStats } = opts;
-
-  // [診断用] ページの処理が「終わった後」だけでなく「始まった瞬間」にもログを出す。
-  // 1ページの処理(検索を含む)に数分かかることがあり、終了後のログしか無いと、
-  // 処理中なのか止まっているのか外から区別できないため。
-  console.error(`[診断] ${page.pageNumber}ページ(文字): 処理開始(行数=${(page.rows || []).length})`);
-
-  const structuredText = buildStructuredTextForPage(page);
-
-  let priceStatsBlock = null;
-  try {
-    const matchedStats = matchStatsToPages([page], allStats || []);
-    priceStatsBlock = buildPriceStatsPromptBlock(matchedStats);
-  } catch (err) {
-    console.error(`⚠️ [${page.pageNumber}ページ] 単価統計のマッチングに失敗しました(通常モードで続行します):`, err.message);
+function withMaxTokensRetryHint(userContent) {
+  if (Array.isArray(userContent)) {
+    return [...userContent, { type: 'text', text: MAX_TOKENS_RETRY_HINT }];
   }
+  return `${userContent}\n\n${MAX_TOKENS_RETRY_HINT}`;
+}
 
-  const userMessage = [
-    workType ? `工事種別: ${workType}` : null,
-    `以下は見積書PDFの${page.pageNumber}ページ目から抽出した構造化データです。上記の観点でチェックしてください。`,
-    '---',
-    structuredText,
-    priceStatsBlock ? '---' : null,
-    priceStatsBlock,
-  ]
-    .filter(Boolean)
-    .join('\n');
-
+/**
+ * 1ページ分のAI呼び出し(web検索の継続・検索上限時の締めくくりを含む)を行い、最終回答のテキストを返す。
+ * 文字ページ(reviewSinglePage)と画像ページ(reviewSingleScannedPage)の共通処理。
+ *   - テキスト応答が得られなかった場合は、最大 MAX_ATTEMPTS_PER_PAGE 回まで試行する。
+ *   - 出力の上限(max_tokens)で回答が途中で切れた場合は、ログに残し、回答を短くする指示を付けて
+ *     そのページだけ1回やり直す。やり直しても切れた/失敗した場合は、切れた回答を
+ *     parseAiJsonResponse の途中切れ修復に回す(救える範囲の指摘だけでも残すため)。
+ * @param {object} params
+ * @param {object} params.client Anthropic クライアント
+ * @param {string} params.system システムプロンプト
+ * @param {string|Array} params.userContent 最初のユーザーメッセージ
+ * @param {string} params.pageLabel ログ表示用のページ識別文字列(例: "3ページ")
+ * @returns {Promise<{ text: string, hitMaxTokens: boolean, webSearchCallCount: number }>}
+ */
+async function runPageReviewConversation({ client, system, userContent, pageLabel }) {
   const tools = [
     {
       type: 'web_search_20250305',
@@ -642,19 +785,20 @@ async function reviewSinglePage(page, opts) {
     },
   ];
 
-  let response = null;
-  let textBlock = null;
-  let lastDiagnostics = null;
   let webSearchCallCount = 0; // [診断用] 実際にweb_searchが何回呼ばれたかをRenderログで確認できるようにする
+  let lastDiagnostics = null;
+  let truncatedText = null; // max_tokensで切れた回答(やり直しても駄目だった場合の予備)
+  let content = userContent;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_PAGE; attempt++) {
-    const messages = [{ role: 'user', content: userMessage }];
+    const messages = [{ role: 'user', content }];
+    let response = null;
 
     for (let round = 1; round <= MAX_SEARCH_ROUNDS_PER_PAGE; round++) {
-      response = await anthropic.messages.create({
+      response = await client.messages.create({
         model: 'claude-sonnet-5',
         max_tokens: 16000,
-        system: SYSTEM_PROMPT,
+        system,
         messages,
         tools,
       });
@@ -682,44 +826,104 @@ async function reviewSinglePage(page, opts) {
           '今すぐ「出力形式」通りのJSON回答のみを出力してください。まだ検索できていない項目があれば、' +
           'basis に「web検索の上限に達したため、学習知識に基づく一般的な相場観」である旨を明記してください。',
       });
-      response = await anthropic.messages.create({
+      response = await client.messages.create({
         model: 'claude-sonnet-5',
         max_tokens: 16000,
-        system: SYSTEM_PROMPT,
+        system,
         messages,
         tools,
         tool_choice: { type: 'none' },
       });
     }
 
-    // web検索を使った場合、「検索します」という説明文のあとに検索結果・最終回答の順で
-    // テキストブロックが並ぶことがあるため、最後のテキストブロックを最終回答として扱う。
-    const textBlocks = response.content.filter((block) => block.type === 'text');
-    textBlock = textBlocks.length > 0 ? textBlocks[textBlocks.length - 1] : null;
-    if (textBlock) break;
+    const text = collectFinalAnswerText(response.content);
+
+    if (response.stop_reason === 'max_tokens') {
+      if (text.trim()) truncatedText = text;
+      const willRetry = attempt < MAX_ATTEMPTS_PER_PAGE;
+      console.warn(
+        `⚠️ [${pageLabel}] AIの回答が出力の上限(max_tokens)に達して途中で切れました(試行${attempt}/${MAX_ATTEMPTS_PER_PAGE}, 回答の文字数=${text.length})。` +
+          (willRetry ? '回答を短くするよう指示して、このページだけやり直します。' : '切れた回答から救える範囲の指摘だけを使います。')
+      );
+      if (willRetry) {
+        content = withMaxTokensRetryHint(userContent);
+        continue;
+      }
+      break;
+    }
+
+    if (text.trim()) return { text, hitMaxTokens: false, webSearchCallCount };
 
     lastDiagnostics = {
-      page: page.pageNumber,
+      page: pageLabel,
       attempt,
       stopReason: response.stop_reason,
       contentTypes: response.content.map((b) => b.type),
     };
     console.warn(
-      `⚠️ [${page.pageNumber}ページ] AIからテキスト応答が得られませんでした(試行${attempt}/${MAX_ATTEMPTS_PER_PAGE})。stop_reason=${response.stop_reason}, content types=${JSON.stringify(
+      `⚠️ [${pageLabel}] AIからテキスト応答が得られませんでした(試行${attempt}/${MAX_ATTEMPTS_PER_PAGE})。stop_reason=${response.stop_reason}, content types=${JSON.stringify(
         lastDiagnostics.contentTypes
       )}`
     );
   }
 
-  if (!textBlock) {
-    throw new Error(
-      `${page.pageNumber}ページ目のAIチェックで、テキスト応答が取得できませんでした(${MAX_ATTEMPTS_PER_PAGE}回試行)。診断情報: ${JSON.stringify(lastDiagnostics)}`
-    );
+  if (truncatedText) return { text: truncatedText, hitMaxTokens: true, webSearchCallCount };
+
+  throw new Error(
+    `${pageLabel}のAIチェックで、テキスト応答が取得できませんでした(${MAX_ATTEMPTS_PER_PAGE}回試行)。診断情報: ${JSON.stringify(lastDiagnostics)}`
+  );
+}
+
+/**
+ * 1ページ分をAIでチェックする。
+ * @param {PageData} page pdfRows.jsの1ページ分
+ * @param {object} opts
+ * @param {string} [opts.workType]
+ * @param {object} [opts.client] Anthropic クライアント(テスト用。省略時は通常のクライアント)
+ * @param {Array} opts.allStats fetchPriceStatsGroupedByItemの結果(全項目分。ページ内の項目にマッチするものだけ絞り込んで使う)
+ * @returns {Promise<{pageNumber: number, summary: string, findings: Array, unclearItems: Array, expertChecklist: Array, truncated: boolean}>}
+ */
+async function reviewSinglePage(page, opts) {
+  const { workType, allStats, client } = opts;
+
+  // [診断用] ページの処理が「終わった後」だけでなく「始まった瞬間」にもログを出す。
+  // 1ページの処理(検索を含む)に数分かかることがあり、終了後のログしか無いと、
+  // 処理中なのか止まっているのか外から区別できないため。
+  console.error(`[診断] ${page.pageNumber}ページ(文字): 処理開始(行数=${(page.rows || []).length})`);
+
+  const structuredText = buildStructuredTextForPage(page);
+
+  let priceStatsBlock = null;
+  try {
+    const matchedStats = matchStatsToPages([page], allStats || []);
+    priceStatsBlock = buildPriceStatsPromptBlock(matchedStats);
+  } catch (err) {
+    console.error(`⚠️ [${page.pageNumber}ページ] 単価統計のマッチングに失敗しました(通常モードで続行します):`, err.message);
   }
 
-  const { aiResult, wasTruncated } = parseAiJsonResponse(textBlock.text, `${page.pageNumber}ページ`);
+  const userMessage = [
+    workType ? `工事種別: ${workType}` : null,
+    `以下は見積書PDFの${page.pageNumber}ページ目から抽出した構造化データです。上記の観点でチェックしてください。`,
+    '---',
+    structuredText,
+    priceStatsBlock ? '---' : null,
+    priceStatsBlock,
+  ]
+    .filter(Boolean)
+    .join('\n');
 
-  const findings = (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai' }));
+  const pageLabel = `${page.pageNumber}ページ`;
+  const { text, hitMaxTokens, webSearchCallCount } = await runPageReviewConversation({
+    client: client || anthropic,
+    system: SYSTEM_PROMPT,
+    userContent: userMessage,
+    pageLabel,
+  });
+
+  const { aiResult, wasTruncated } = parseAiJsonResponse(text, pageLabel);
+  const normalized = normalizeAiResult(aiResult, page.pageNumber, pageLabel);
+
+  const findings = normalized.findings.map((f) => ({ ...f, source: f.source || 'ai' }));
 
   // [診断用] このページで実際に何件のfindingsが出て、web_searchが何回呼ばれたかをRenderログに出す。
   // 「プロンプトを直したのにfindingsが0件のまま」という状況が、デプロイ未反映なのか、
@@ -730,11 +934,11 @@ async function reviewSinglePage(page, opts) {
 
   return {
     pageNumber: page.pageNumber,
-    summary: aiResult.summary || '',
+    summary: normalized.summary,
     findings,
-    unclearItems: aiResult.unclearItems || [],
-    expertChecklist: aiResult.expertChecklist || [],
-    truncated: wasTruncated,
+    unclearItems: normalized.unclearItems,
+    expertChecklist: normalized.expertChecklist,
+    truncated: wasTruncated || hitMaxTokens,
   };
 }
 
@@ -758,10 +962,11 @@ async function extractSinglePagePdfBuffer(pdfBuffer, pageNumber) {
  * @param {number} pageNumber チェック対象のページ番号(1始まり)
  * @param {object} opts
  * @param {string} [opts.workType]
+ * @param {object} [opts.client] Anthropic クライアント(テスト用。省略時は通常のクライアント)
  * @returns {Promise<{pageNumber: number, summary: string, findings: Array, unclearItems: Array, expertChecklist: Array, truncated: boolean}>}
  */
 async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
-  const { workType } = opts;
+  const { workType, client } = opts;
 
   console.error(`[診断] ${pageNumber}ページ(画像): 処理開始`);
 
@@ -785,87 +990,18 @@ async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
     },
   ];
 
-  const tools = [
-    {
-      type: 'web_search_20250305',
-      name: 'web_search',
-      max_uses: WEB_SEARCH_MAX_USES_PER_PAGE,
-    },
-  ];
+  const pageLabel = `${pageNumber}ページ(画像)`;
+  const { text, hitMaxTokens, webSearchCallCount } = await runPageReviewConversation({
+    client: client || anthropic,
+    system: SYSTEM_PROMPT_SCANNED,
+    userContent,
+    pageLabel,
+  });
 
-  let response = null;
-  let textBlock = null;
-  let lastDiagnostics = null;
-  let webSearchCallCount = 0; // [診断用] 実際にweb_searchが何回呼ばれたかをRenderログで確認できるようにする
+  const { aiResult, wasTruncated } = parseAiJsonResponse(text, pageLabel);
+  const normalized = normalizeAiResult(aiResult, pageNumber, pageLabel);
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_PAGE; attempt++) {
-    const messages = [{ role: 'user', content: userContent }];
-
-    for (let round = 1; round <= MAX_SEARCH_ROUNDS_PER_PAGE; round++) {
-      response = await anthropic.messages.create({
-        model: 'claude-sonnet-5',
-        max_tokens: 16000,
-        system: SYSTEM_PROMPT_SCANNED,
-        messages,
-        tools,
-      });
-
-      webSearchCallCount += response.content.filter(
-        (b) => b.type === 'server_tool_use' && b.name === 'web_search'
-      ).length;
-
-      if (response.stop_reason !== 'pause_turn') break;
-      messages.push({ role: 'assistant', content: response.content });
-    }
-
-    if (response.stop_reason === 'pause_turn') {
-      // 検索ラウンドの上限に達してもAIがまだ検索を続けたがっている状態。ここで打ち切ると
-      // 「〜を調査します。」のような予告文だけが最終回答として扱われてしまうため、
-      // ツールを使わせない呼び出しを1回追加し、ここまでの情報だけでJSON回答を締めくくらせる。
-      messages.push({ role: 'assistant', content: response.content });
-      messages.push({
-        role: 'user',
-        content:
-          'このページの検索回数の上限に達しました。追加の検索はせず、ここまでに判明している情報だけを使って、' +
-          '今すぐ「出力形式」通りのJSON回答のみを出力してください。まだ検索できていない項目があれば、' +
-          'basis に「web検索の上限に達したため、学習知識に基づく一般的な相場観」である旨を明記してください。',
-      });
-      response = await anthropic.messages.create({
-        model: 'claude-sonnet-5',
-        max_tokens: 16000,
-        system: SYSTEM_PROMPT_SCANNED,
-        messages,
-        tools,
-        tool_choice: { type: 'none' },
-      });
-    }
-
-    const textBlocks = response.content.filter((block) => block.type === 'text');
-    textBlock = textBlocks.length > 0 ? textBlocks[textBlocks.length - 1] : null;
-    if (textBlock) break;
-
-    lastDiagnostics = {
-      page: pageNumber,
-      attempt,
-      stopReason: response.stop_reason,
-      contentTypes: response.content.map((b) => b.type),
-    };
-    console.warn(
-      `⚠️ [${pageNumber}ページ(画像)] AIからテキスト応答が得られませんでした(試行${attempt}/${MAX_ATTEMPTS_PER_PAGE})。stop_reason=${response.stop_reason}, content types=${JSON.stringify(
-        lastDiagnostics.contentTypes
-      )}`
-    );
-  }
-
-  if (!textBlock) {
-    throw new Error(
-      `${pageNumber}ページ目(画像)のAIチェックで、テキスト応答が取得できませんでした(${MAX_ATTEMPTS_PER_PAGE}回試行)。診断情報: ${JSON.stringify(lastDiagnostics)}`
-    );
-  }
-
-  const { aiResult, wasTruncated } = parseAiJsonResponse(textBlock.text, `${pageNumber}ページ(画像)`);
-
-  const findings = (aiResult.findings || []).map((f) => ({ ...f, source: f.source || 'ai-vision' }));
+  const findings = normalized.findings.map((f) => ({ ...f, source: f.source || 'ai-vision' }));
 
   console.error(
     `[診断] ${pageNumber}ページ(画像): web検索回数=${webSearchCallCount}, findings件数=${findings.length}`
@@ -873,11 +1009,11 @@ async function reviewSingleScannedPage(pdfBuffer, pageNumber, opts) {
 
   return {
     pageNumber,
-    summary: aiResult.summary || '',
+    summary: normalized.summary,
     findings,
-    unclearItems: aiResult.unclearItems || [],
-    expertChecklist: aiResult.expertChecklist || [],
-    truncated: wasTruncated,
+    unclearItems: normalized.unclearItems,
+    expertChecklist: normalized.expertChecklist,
+    truncated: wasTruncated || hitMaxTokens,
   };
 }
 
@@ -1030,4 +1166,17 @@ async function reviewEstimate(structuredPages, context = {}) {
   };
 }
 
-module.exports = { reviewEstimate, arithmeticCheck, crossPageDuplicateCheck, SYSTEM_PROMPT };
+module.exports = {
+  reviewEstimate,
+  arithmeticCheck,
+  crossPageDuplicateCheck,
+  SYSTEM_PROMPT,
+  // 以下はテスト(aiReview.test.js)用
+  _internal: {
+    collectFinalAnswerText,
+    parseAiJsonResponse,
+    normalizeAiResult,
+    runPageReviewConversation,
+    reviewSinglePage,
+  },
+};
